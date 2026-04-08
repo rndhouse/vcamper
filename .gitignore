@@ -1,0 +1,10 @@
+.vcamper-state/
+.vcamp-state/
+.tmp/
+AGENTS.md
+.codex
+
+
+# Added by cargo
+
+/target
