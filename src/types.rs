@@ -222,7 +222,7 @@ pub(crate) struct ProgressResult {
     pub(crate) candidate_summary: String,
     /// Number of suspicious findings retained from analysis.
     pub(crate) finding_count: usize,
-    /// Whether a completed candidate directory was retained on disk.
+    /// Whether a completed candidate directory is available on disk.
     pub(crate) artifacts_retained: bool,
 }
 

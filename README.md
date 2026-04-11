@@ -60,7 +60,7 @@ Re-run the same command with the same `--out` directory to resume after an inter
 
 By default, VCamper suppresses provider event output in the terminal. The default terminal view shows candidate progress and an active spinner while the provider is working.
 
-Incomplete candidates live under `wip/` inside the output directory. Clean completed candidates are checkpointed in `progress.json` and their artifact directories are removed. Candidates with suspicious findings keep their completed artifact directories.
+Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
 VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`.
 
@@ -84,7 +84,7 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `manifest.json`: selected repo, range, and CLI settings
 - `progress.json`: pretty-printed pending and complete candidate lists with top-level counters
 - `wip/candidate-*`: in-progress candidate artifacts that have not completed yet
-- `candidate-*/input.json`: full collected commit evidence for a candidate that retained artifacts
+- `candidate-*/input.json`: full collected commit evidence for a completed candidate
 - `candidate-*/screen/prompt-input.json`: code-first screener evidence exposed to the provider prompt
 - `candidate-*/screen/prompt.txt`: rendered screener prompt
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output

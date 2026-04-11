@@ -331,7 +331,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             verification,
         };
         persist_candidate_outcome(&wip_dir, &outcome)?;
-        let keep_candidate_dir = should_retain_candidate_artifacts(&outcome);
+        let keep_candidate_dir = should_retain_candidate_artifacts();
         finalize_candidate_dir(&wip_dir, &completed_dir, keep_candidate_dir, verbose)?;
         update_candidate_progress(
             &run_dir,
@@ -774,8 +774,11 @@ fn promote_completed_candidate(wip_dir: &Path, completed_dir: &Path, verbose: bo
 }
 
 /// Returns true when candidate artifacts should remain on disk after completion.
-fn should_retain_candidate_artifacts(outcome: &CandidateOutcome) -> bool {
-    !outcome.final_findings().is_empty()
+///
+/// Prompt inputs and rendered prompts are primary debugging artifacts, so completed candidates
+/// keep their directories even when analysis finishes with no findings.
+fn should_retain_candidate_artifacts() -> bool {
+    true
 }
 
 /// Builds the persisted result metadata for one completed candidate.
@@ -791,6 +794,8 @@ fn progress_result_from_outcome(
 }
 
 /// Reconstructs a completed clean outcome from `progress.json`.
+///
+/// This supports legacy runs created before completed candidate directories were always retained.
 fn load_completed_clean_outcome(
     run_dir: &Path,
     candidate_index: usize,
@@ -1096,7 +1101,7 @@ mod tests {
             Some(ProgressResult {
                 candidate_summary: "summary".into(),
                 finding_count: 0,
-                artifacts_retained: false,
+                artifacts_retained: true,
             }),
         )
         .expect("progress should update");
@@ -1108,6 +1113,37 @@ mod tests {
         assert_eq!(progress.complete.len(), 1);
         assert_eq!(progress.complete[0].result.finding_count, 0);
         assert_eq!(progress.pending[0].status, ProgressStatus::Pending);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loads_legacy_clean_outcome_from_progress_without_artifacts() {
+        let dir = temp_test_dir("legacy-clean-outcome");
+        let candidates = vec![CommitCandidate {
+            candidate_index: 0,
+            commit: sample_commit("a"),
+        }];
+
+        initialize_progress_state(&dir, &candidates).expect("progress should initialize");
+        super::update_candidate_progress(
+            &dir,
+            0,
+            None,
+            Some(ProgressResult {
+                candidate_summary: "legacy summary".into(),
+                finding_count: 0,
+                artifacts_retained: false,
+            }),
+        )
+        .expect("progress should update");
+
+        let loaded = load_saved_candidate_outcome(&dir, &dir.join("candidate-0000"), 0, false)
+            .expect("outcome should load")
+            .expect("legacy outcome should exist");
+        assert_eq!(loaded.screening.candidate_summary, "legacy summary");
+        assert!(loaded.screening.suspicious_findings.is_empty());
+        assert!(loaded.verification.is_none());
 
         let _ = fs::remove_dir_all(dir);
     }
