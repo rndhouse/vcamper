@@ -103,6 +103,21 @@ pub(crate) fn render_screen_prompt(repo_root: &str, candidate: &CommitCandidate)
     ))
 }
 
+/// Renders the Codex-specific first-pass prompt for one commit candidate.
+pub(crate) fn render_codex_screen_prompt() -> String {
+    format!(
+        "{SCREEN_COMMIT_TEMPLATE}\n\n\
+         All evidence for this screening pass is available in the current working directory.\n\
+         Start with `prompt-input.json`.\n\
+         Then inspect the files it references under `evidence/`.\n\
+         Treat this pass directory as the full evidence bundle for the candidate.\n\
+         Commit messages are intentionally withheld for this first-pass analysis.\n\
+         Do not rely on files outside this working directory.\n\
+         Return a JSON object that matches the supplied schema.\n\
+         Use an empty suspicious_findings array when this commit does not look security-relevant.\n"
+    )
+}
+
 /// Renders the second-pass verifier prompt for one commit candidate.
 pub(crate) fn render_verify_prompt(
     repo_root: &str,
@@ -126,11 +141,27 @@ pub(crate) fn render_verify_prompt(
     ))
 }
 
+/// Renders the Codex-specific second-pass verifier prompt for one commit candidate.
+pub(crate) fn render_codex_verify_prompt() -> String {
+    format!(
+        "{VERIFY_COMMIT_TEMPLATE}\n\n\
+         All evidence for this verification pass is available in the current working directory.\n\
+         Start with `prompt-input.json`.\n\
+         Then inspect the files it references under `evidence/`.\n\
+         Treat this pass directory as the full evidence bundle for the candidate.\n\
+         Use the commit message and screening hypothesis restored in `prompt-input.json` as\n\
+         secondary context.\n\
+         Do not rely on files outside this working directory.\n\
+         Return a JSON object that matches the supplied schema.\n\
+         Use an empty confirmed_findings array when the screener hypothesis does not hold up.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_prompt_input, build_verification_prompt_input, render_screen_prompt,
-        render_verify_prompt,
+        build_prompt_input, build_verification_prompt_input, render_codex_screen_prompt,
+        render_codex_verify_prompt, render_screen_prompt, render_verify_prompt,
     };
     use crate::types::{CommitCandidate, CommitRecord, FileStat, ScreeningAnalysis};
 
@@ -193,6 +224,16 @@ mod tests {
     }
 
     #[test]
+    fn codex_screen_prompt_points_to_bundle_files() {
+        let prompt = render_codex_screen_prompt();
+
+        assert!(prompt.contains("prompt-input.json"));
+        assert!(prompt.contains("evidence/"));
+        assert!(prompt.contains("Commit messages are intentionally withheld"));
+        assert!(!prompt.contains("Repository root:"));
+    }
+
+    #[test]
     fn verification_prompt_restores_commit_message_and_screening_hypothesis() {
         let candidate = CommitCandidate {
             candidate_index: 0,
@@ -224,5 +265,15 @@ mod tests {
         assert!(json.contains("routine message"));
         assert!(json.contains("screening summary"));
         assert!(prompt.contains("confirmed_findings"));
+    }
+
+    #[test]
+    fn codex_verify_prompt_points_to_bundle_files() {
+        let prompt = render_codex_verify_prompt();
+
+        assert!(prompt.contains("prompt-input.json"));
+        assert!(prompt.contains("evidence/"));
+        assert!(prompt.contains("screening hypothesis"));
+        assert!(!prompt.contains("Repository root:"));
     }
 }

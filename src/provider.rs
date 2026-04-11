@@ -16,8 +16,8 @@ use crate::types::{ScreeningAnalysis, VerificationAnalysis};
 
 /// Provider invocation request for one commit candidate.
 pub(crate) struct ProviderRequest<'a> {
-    /// Repository root used as the provider working directory.
-    pub(crate) repo_root: &'a Path,
+    /// Working directory exposed to the provider for this pass.
+    pub(crate) working_dir: &'a Path,
     /// Rendered prompt text.
     pub(crate) prompt: &'a str,
     /// JSON schema for structured output.
@@ -203,8 +203,12 @@ fn run_codex_structured<T>(request: ProviderRequest<'_>) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let schema_path = request.pass_dir.join("schema.json");
-    let response_path = request.pass_dir.join("response.json");
+    let pass_dir = fs::canonicalize(request.pass_dir)
+        .with_context(|| format!("failed to resolve {}", request.pass_dir.display()))?;
+    let working_dir = fs::canonicalize(request.working_dir)
+        .with_context(|| format!("failed to resolve {}", request.working_dir.display()))?;
+    let schema_path = pass_dir.join("schema.json");
+    let response_path = pass_dir.join("response.json");
     fs::write(&schema_path, request.schema)
         .with_context(|| format!("failed to write {}", schema_path.display()))?;
 
@@ -212,7 +216,7 @@ where
     command
         .arg("exec")
         .arg("--cd")
-        .arg(request.repo_root)
+        .arg(&working_dir)
         .arg("--sandbox")
         .arg("read-only")
         .arg("--skip-git-repo-check")

@@ -52,7 +52,7 @@ Useful flags:
 - `--screen-effort <low|medium|high|xhigh>`: set the first-pass screener effort
 - `--verify-effort <low|medium|high|xhigh>`: set the second-pass verifier effort
 - `--max-commits <n>`: fail fast when the range is larger than expected
-- `--max-patch-bytes <n>`: cap the diff bytes sent for each commit candidate
+- `--max-patch-bytes <n>`: cap the diff bytes stored in truncated commit artifacts and inline fallback prompts
 - `--out <dir>`: write artifacts to a specific run directory
 - `--verbose`: print detailed internal logs and streamed provider output
 
@@ -61,6 +61,8 @@ Re-run the same command with the same `--out` directory to resume after an inter
 By default, VCamper suppresses provider event output in the terminal. The default terminal view shows candidate progress and an active spinner while the provider is working.
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
+
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, and before/after snapshots for changed files. That keeps the screen pass closer to commit-local analysis and avoids losing diff context to prompt-size truncation.
 
 VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`.
 
@@ -84,13 +86,21 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `manifest.json`: selected repo, range, and CLI settings
 - `progress.json`: pretty-printed pending and complete candidate lists with top-level counters
 - `wip/candidate-*`: in-progress candidate artifacts that have not completed yet
-- `candidate-*/input.json`: full collected commit evidence for a completed candidate
+- `candidate-*/input.json`: collected commit evidence artifact for a completed candidate
 - `candidate-*/screen/prompt-input.json`: code-first screener evidence exposed to the provider prompt
 - `candidate-*/screen/prompt.txt`: rendered screener prompt
+- `candidate-*/screen/evidence/patch.diff`: full untruncated patch for the screening pass
+- `candidate-*/screen/evidence/changed-files.txt`: changed file list for the screening pass
+- `candidate-*/screen/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
+- `candidate-*/screen/evidence/before/*` and `candidate-*/screen/evidence/after/*`: file snapshots available to Codex during screening
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output
 - `candidate-*/screen/analysis.json`: completed screener result
 - `candidate-*/verify/prompt-input.json`: verifier evidence including the screener hypothesis and commit message
 - `candidate-*/verify/prompt.txt`: rendered verifier prompt
+- `candidate-*/verify/evidence/patch.diff`: full untruncated patch for the verification pass
+- `candidate-*/verify/evidence/changed-files.txt`: changed file list for the verification pass
+- `candidate-*/verify/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
+- `candidate-*/verify/evidence/before/*` and `candidate-*/verify/evidence/after/*`: file snapshots available to Codex during verification
 - `candidate-*/verify/stdout.txt` and `candidate-*/verify/stderr.txt`: verifier provider output
 - `candidate-*/verify/analysis.json`: completed verifier result
 - `candidate-*/outcome.json`: final combined candidate outcome across both passes

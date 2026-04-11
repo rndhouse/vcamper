@@ -2,14 +2,14 @@
 //! Ownership: client-only
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
-use crate::cli::{AnalyzeArgs, Cli, Commands};
+use crate::cli::{AnalyzeArgs, Cli, Commands, ProviderKind};
 use crate::git;
 use crate::prompt;
 use crate::provider::{
@@ -17,9 +17,9 @@ use crate::provider::{
 };
 use crate::report;
 use crate::types::{
-    CandidateOutcome, CommitCandidate, ProgressCompleteCandidate, ProgressPendingCandidate,
-    ProgressResult, ProgressState, ProgressStatus, RunManifest, ScreeningAnalysis,
-    VerificationAnalysis,
+    CandidateOutcome, CommitCandidate, FileStat, ProgressCompleteCandidate,
+    ProgressPendingCandidate, ProgressResult, ProgressState, ProgressStatus, RunManifest,
+    ScreeningAnalysis, VerificationAnalysis,
 };
 
 /// Runs the selected CLI command.
@@ -196,17 +196,12 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             None,
         )?;
         prepare_wip_candidate_dir(&wip_dir, verbose)?;
-        persist_candidate_input(&wip_dir, candidate)?;
 
         let screen_dir = pass_dir(&wip_dir, AnalysisPhase::Screen);
         fs::create_dir_all(&screen_dir)
             .with_context(|| format!("failed to create {}", screen_dir.display()))?;
-        let screen_prompt = prompt::render_screen_prompt(&manifest.repo_root, candidate)?;
-        persist_pass_artifacts(
-            &screen_dir,
-            &prompt::build_prompt_input(candidate),
-            &screen_prompt,
-        )?;
+        let screen_prompt =
+            prepare_screen_pass_artifacts(args.provider, &repo_root, &screen_dir, candidate)?;
 
         if args.dry_run {
             log_step(
@@ -224,6 +219,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 },
                 verification: None,
             };
+            persist_candidate_input(&wip_dir, candidate)?;
             persist_screening_analysis(&screen_dir, &outcome.screening)?;
             persist_candidate_outcome(&wip_dir, &outcome)?;
             promote_completed_candidate(&wip_dir, &completed_dir, verbose)?;
@@ -253,7 +249,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             ),
         );
         let screening = provider.screen_candidate(ProviderRequest {
-            repo_root: &repo_root,
+            working_dir: &screen_dir,
             prompt: &screen_prompt,
             schema: &screen_schema,
             pass_dir: &screen_dir,
@@ -280,12 +276,12 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             let verify_dir = pass_dir(&wip_dir, AnalysisPhase::Verify);
             fs::create_dir_all(&verify_dir)
                 .with_context(|| format!("failed to create {}", verify_dir.display()))?;
-            let verify_prompt =
-                prompt::render_verify_prompt(&manifest.repo_root, candidate, &screening)?;
-            persist_pass_artifacts(
+            let verify_prompt = prepare_verify_pass_artifacts(
+                args.provider,
+                &repo_root,
                 &verify_dir,
-                &prompt::build_verification_prompt_input(candidate, &screening),
-                &verify_prompt,
+                candidate,
+                &screening,
             )?;
             progress.start_phase(
                 candidate.candidate_index,
@@ -302,7 +298,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 ),
             );
             let verification = provider.verify_candidate(ProviderRequest {
-                repo_root: &repo_root,
+                working_dir: &verify_dir,
                 prompt: &verify_prompt,
                 schema: &verify_schema,
                 pass_dir: &verify_dir,
@@ -330,6 +326,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             screening,
             verification,
         };
+        persist_candidate_input(&wip_dir, candidate)?;
         persist_candidate_outcome(&wip_dir, &outcome)?;
         let keep_candidate_dir = should_retain_candidate_artifacts();
         finalize_candidate_dir(&wip_dir, &completed_dir, keep_candidate_dir, verbose)?;
@@ -540,6 +537,267 @@ where
     })?;
     fs::write(pass_dir.join("prompt.txt"), prompt)
         .with_context(|| format!("failed to write {}", pass_dir.join("prompt.txt").display()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodexPromptCommit {
+    id: String,
+    short_id: String,
+    parent_ids: Vec<String>,
+    files_changed: Vec<String>,
+    file_stats: Vec<FileStat>,
+    patch_file: String,
+    changed_files_file: String,
+    snapshot_manifest_file: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexScreenPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexVerifyPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    commit_message: String,
+    screening_hypothesis: ScreeningAnalysis,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexSnapshotEntry {
+    path: String,
+    before_file: Option<String>,
+    after_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexEvidenceRefs {
+    patch_file: String,
+    changed_files_file: String,
+    snapshot_manifest_file: String,
+}
+
+/// Prepares one screening-pass prompt and pass artifacts for the selected provider.
+fn prepare_screen_pass_artifacts(
+    provider: ProviderKind,
+    repo_root: &Path,
+    pass_dir: &Path,
+    candidate: &CommitCandidate,
+) -> Result<String> {
+    match provider {
+        ProviderKind::Codex => {
+            let prompt_input = build_codex_screen_prompt_input(repo_root, pass_dir, candidate)?;
+            let prompt = prompt::render_codex_screen_prompt();
+            persist_pass_artifacts(pass_dir, &prompt_input, &prompt)?;
+            Ok(prompt)
+        }
+        ProviderKind::Claude => {
+            let repo_root = repo_root.display().to_string();
+            let prompt = prompt::render_screen_prompt(&repo_root, candidate)?;
+            persist_pass_artifacts(pass_dir, &prompt::build_prompt_input(candidate), &prompt)?;
+            Ok(prompt)
+        }
+    }
+}
+
+/// Prepares one verification-pass prompt and pass artifacts for the selected provider.
+fn prepare_verify_pass_artifacts(
+    provider: ProviderKind,
+    repo_root: &Path,
+    pass_dir: &Path,
+    candidate: &CommitCandidate,
+    screening: &ScreeningAnalysis,
+) -> Result<String> {
+    match provider {
+        ProviderKind::Codex => {
+            let prompt_input =
+                build_codex_verify_prompt_input(repo_root, pass_dir, candidate, screening)?;
+            let prompt = prompt::render_codex_verify_prompt();
+            persist_pass_artifacts(pass_dir, &prompt_input, &prompt)?;
+            Ok(prompt)
+        }
+        ProviderKind::Claude => {
+            let repo_root = repo_root.display().to_string();
+            let prompt = prompt::render_verify_prompt(&repo_root, candidate, screening)?;
+            persist_pass_artifacts(
+                pass_dir,
+                &prompt::build_verification_prompt_input(candidate, screening),
+                &prompt,
+            )?;
+            Ok(prompt)
+        }
+    }
+}
+
+/// Builds the Codex screening-pass prompt input after persisting a pass-local evidence bundle.
+fn build_codex_screen_prompt_input(
+    repo_root: &Path,
+    pass_dir: &Path,
+    candidate: &CommitCandidate,
+) -> Result<CodexScreenPromptInput> {
+    let evidence = persist_codex_evidence_bundle(pass_dir, repo_root, candidate)?;
+
+    Ok(CodexScreenPromptInput {
+        candidate_index: candidate.candidate_index,
+        commit: build_codex_prompt_commit(candidate, evidence),
+    })
+}
+
+/// Builds the Codex verification-pass prompt input after persisting a pass-local evidence bundle.
+fn build_codex_verify_prompt_input(
+    repo_root: &Path,
+    pass_dir: &Path,
+    candidate: &CommitCandidate,
+    screening: &ScreeningAnalysis,
+) -> Result<CodexVerifyPromptInput> {
+    let evidence = persist_codex_evidence_bundle(pass_dir, repo_root, candidate)?;
+
+    Ok(CodexVerifyPromptInput {
+        candidate_index: candidate.candidate_index,
+        commit: build_codex_prompt_commit(candidate, evidence),
+        commit_message: candidate.commit.summary.clone(),
+        screening_hypothesis: screening.clone(),
+    })
+}
+
+/// Builds the Codex-facing commit summary that points to persisted evidence files.
+fn build_codex_prompt_commit(
+    candidate: &CommitCandidate,
+    evidence: CodexEvidenceRefs,
+) -> CodexPromptCommit {
+    CodexPromptCommit {
+        id: candidate.commit.id.clone(),
+        short_id: candidate.commit.short_id.clone(),
+        parent_ids: candidate.commit.parent_ids.clone(),
+        files_changed: candidate.commit.files_changed.clone(),
+        file_stats: candidate.commit.file_stats.clone(),
+        patch_file: evidence.patch_file,
+        changed_files_file: evidence.changed_files_file,
+        snapshot_manifest_file: evidence.snapshot_manifest_file,
+    }
+}
+
+/// Persists the Codex evidence bundle for one pass with a full patch and per-file snapshots.
+fn persist_codex_evidence_bundle(
+    pass_dir: &Path,
+    repo_root: &Path,
+    candidate: &CommitCandidate,
+) -> Result<CodexEvidenceRefs> {
+    let evidence_dir = pass_dir.join("evidence");
+    fs::create_dir_all(&evidence_dir)
+        .with_context(|| format!("failed to create {}", evidence_dir.display()))?;
+
+    let patch_path = evidence_dir.join("patch.diff");
+    fs::write(
+        &patch_path,
+        git::load_full_patch(repo_root, &candidate.commit.id)?,
+    )
+    .with_context(|| format!("failed to write {}", patch_path.display()))?;
+
+    let changed_files_path = evidence_dir.join("changed-files.txt");
+    let changed_files = if candidate.commit.files_changed.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", candidate.commit.files_changed.join("\n"))
+    };
+    fs::write(&changed_files_path, changed_files)
+        .with_context(|| format!("failed to write {}", changed_files_path.display()))?;
+
+    let snapshot_manifest_path = evidence_dir.join("file-snapshots.json");
+    let snapshots = persist_codex_file_snapshots(&evidence_dir, repo_root, candidate)?;
+    fs::write(
+        &snapshot_manifest_path,
+        serde_json::to_string_pretty(&snapshots)?,
+    )
+    .with_context(|| format!("failed to write {}", snapshot_manifest_path.display()))?;
+
+    Ok(CodexEvidenceRefs {
+        patch_file: "evidence/patch.diff".to_owned(),
+        changed_files_file: "evidence/changed-files.txt".to_owned(),
+        snapshot_manifest_file: "evidence/file-snapshots.json".to_owned(),
+    })
+}
+
+/// Persists before/after snapshots for changed files inside one Codex evidence bundle.
+fn persist_codex_file_snapshots(
+    evidence_dir: &Path,
+    repo_root: &Path,
+    candidate: &CommitCandidate,
+) -> Result<Vec<CodexSnapshotEntry>> {
+    let before_root = evidence_dir.join("before");
+    let after_root = evidence_dir.join("after");
+    let parent_revision = candidate.commit.parent_ids.first().map(String::as_str);
+    let mut snapshots = Vec::with_capacity(candidate.commit.files_changed.len());
+
+    for path in &candidate.commit.files_changed {
+        let before_file = if let Some(parent_revision) = parent_revision {
+            persist_snapshot_file(
+                repo_root,
+                parent_revision,
+                path,
+                &before_root,
+                "evidence/before",
+            )?
+        } else {
+            None
+        };
+        let after_file = persist_snapshot_file(
+            repo_root,
+            &candidate.commit.id,
+            path,
+            &after_root,
+            "evidence/after",
+        )?;
+        snapshots.push(CodexSnapshotEntry {
+            path: path.clone(),
+            before_file,
+            after_file,
+        });
+    }
+
+    Ok(snapshots)
+}
+
+/// Persists one file snapshot from a specific revision into the pass-local evidence bundle.
+fn persist_snapshot_file(
+    repo_root: &Path,
+    revision: &str,
+    repo_relative_path: &str,
+    snapshot_root: &Path,
+    snapshot_label: &str,
+) -> Result<Option<String>> {
+    let Some(contents) = git::load_file_at_revision(repo_root, revision, repo_relative_path)?
+    else {
+        return Ok(None);
+    };
+
+    let snapshot_path = bundle_snapshot_path(snapshot_root, repo_relative_path)?;
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&snapshot_path, contents)
+        .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
+
+    Ok(Some(format!("{snapshot_label}/{repo_relative_path}")))
+}
+
+/// Resolves one repo-relative path inside the evidence bundle snapshot tree.
+fn bundle_snapshot_path(root: &Path, repo_relative_path: &str) -> Result<PathBuf> {
+    let mut resolved = root.to_path_buf();
+    for component in Path::new(repo_relative_path).components() {
+        match component {
+            Component::Normal(segment) => resolved.push(segment),
+            _ => bail!(
+                "unsupported changed file path for evidence bundle: {}",
+                repo_relative_path
+            ),
+        }
+    }
+
+    Ok(resolved)
 }
 
 /// Builds one candidate per included commit.
@@ -1014,7 +1272,7 @@ impl ProgressUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_manifest, initialize_progress_state, load_progress_state,
+        bundle_snapshot_path, ensure_manifest, initialize_progress_state, load_progress_state,
         load_saved_candidate_outcome, persist_candidate_outcome, validate_args,
     };
     use crate::cli::{AnalyzeArgs, ProviderKind};
@@ -1023,7 +1281,7 @@ mod tests {
         RunManifest, ScreeningAnalysis,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1146,6 +1404,19 @@ mod tests {
         assert!(loaded.verification.is_none());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bundle_snapshot_path_preserves_repo_relative_layout() {
+        let resolved = bundle_snapshot_path(Path::new("/tmp/bundle"), "src/nested/file.rs")
+            .expect("bundle path should resolve");
+
+        assert_eq!(resolved, PathBuf::from("/tmp/bundle/src/nested/file.rs"));
+    }
+
+    #[test]
+    fn bundle_snapshot_path_rejects_parent_traversal() {
+        assert!(bundle_snapshot_path(Path::new("/tmp/bundle"), "../secret").is_err());
     }
 
     fn sample_manifest(provider: &str) -> RunManifest {

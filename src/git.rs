@@ -87,17 +87,7 @@ pub(crate) fn load_commit(
         ["show", "--format=", "--numstat", revision],
     )?);
 
-    let patch_output = run_git(
-        repo,
-        [
-            "show",
-            "--format=",
-            "--patch",
-            "--unified=3",
-            "--find-renames",
-            revision,
-        ],
-    )?;
+    let patch_output = load_full_patch(repo, revision)?;
     let (patch, patch_truncated) = truncate_text(patch_output, max_patch_bytes);
 
     Ok(CommitRecord {
@@ -113,6 +103,37 @@ pub(crate) fn load_commit(
         patch,
         patch_truncated,
     })
+}
+
+/// Loads the full unified patch text for one commit without applying prompt-size limits.
+pub(crate) fn load_full_patch(repo: &Path, revision: &str) -> Result<String> {
+    run_git(
+        repo,
+        [
+            "show",
+            "--format=",
+            "--patch",
+            "--unified=3",
+            "--find-renames",
+            revision,
+        ],
+    )
+}
+
+/// Loads one tracked file as raw bytes from a specific revision.
+///
+/// Returns `Ok(None)` when the path does not exist at the requested revision.
+pub(crate) fn load_file_at_revision(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>> {
+    let spec = format!("{revision}:{path}");
+    if !git_object_exists(repo, &spec)? {
+        return Ok(None);
+    }
+
+    run_git_bytes(repo, ["show", &spec]).map(Some)
 }
 
 fn next_meta<'a, I>(parts: &mut I, label: &'static str) -> Result<String>
@@ -197,6 +218,21 @@ fn inclusive_commit_list(from: &str, commits: Vec<String>) -> Vec<String> {
     inclusive
 }
 
+/// Returns true when one git object expression resolves successfully.
+fn git_object_exists(repo: &Path, spec: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["cat-file", "-e", spec])
+        .current_dir(repo)
+        .status()
+        .with_context(|| format!("failed to start git cat-file -e {spec}"))?;
+
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1 | 128) => Ok(false),
+        _ => bail!("git cat-file -e {} failed with status {}", spec, status),
+    }
+}
+
 fn run_git<I, S>(repo: &Path, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -220,6 +256,29 @@ where
     String::from_utf8(output.stdout)
         .map(|value| value.trim_end_matches('\n').to_owned())
         .context("git output was not valid UTF-8")
+}
+
+fn run_git_bytes<I, S>(repo: &Path, args: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let collected: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    let output = Command::new("git")
+        .args(&collected)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("failed to start git {}", collected.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", collected.join(" "), stderr.trim());
+    }
+
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
