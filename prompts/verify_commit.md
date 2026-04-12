@@ -40,6 +40,15 @@ Check whether the patch removes or fences off a legacy, compatibility, fallback,
 
 Use the commit message only after you have reasoned about the code. State whether it honestly describes the change, understates the security consequence, or reads like ordinary maintenance wrapped around a stronger security fix.
 
+If the strongest screened hypothesis fails, continue with the remaining hotspot clusters and look for a stronger alternative before you return `rejected`. Reject the candidate only when you have challenged the screened explanation and still do not see a stable security conclusion elsewhere in the changed verification, parser, or cryptographic paths.
+
+Treat these crypto-specific patterns as high-signal during verification:
+
+- digest-length guards on verify entry points and lower-level helpers
+- changes where one identifier picks the hash while another picks the verifier
+- feature interactions that change behavior only when multiple algorithm families are enabled
+- commits that touch both certificate/ASN.1 verification and detached sign/verify APIs in the same patch
+
 Return a skeptical verification result:
 
 - `confirmed` when the commit plausibly fixes a real security issue

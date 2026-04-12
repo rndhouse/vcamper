@@ -4,7 +4,9 @@
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::to_string_pretty;
+use std::path::Path;
 
+use crate::hotspot::HotspotCluster;
 use crate::types::{CommitCandidate, FileStat, ScreeningAnalysis};
 
 const SCREEN_COMMIT_TEMPLATE: &str = include_str!("../prompts/analyze_commit.md");
@@ -103,18 +105,45 @@ pub(crate) fn render_screen_prompt(repo_root: &str, candidate: &CommitCandidate)
     ))
 }
 
-/// Renders the Codex-specific first-pass prompt for one commit candidate.
-pub(crate) fn render_codex_screen_prompt() -> String {
+/// Renders the Codex-specific screening-plan prompt for one commit candidate.
+pub(crate) fn render_codex_screen_plan_prompt(
+    cluster_count: usize,
+    prompt_input_path: &Path,
+) -> String {
     format!(
         "{SCREEN_COMMIT_TEMPLATE}\n\n\
-         All evidence for this screening pass is available in the current working directory.\n\
-         Start with `prompt-input.json`.\n\
-         Then inspect the files it references under `evidence/`.\n\
-         Treat this pass directory as the full evidence bundle for the candidate.\n\
+         This screening pass is clustered.\n\
+         Start with `{prompt_input_path}` to review the hotspot plan.\n\
+         Then inspect the cluster-specific bundles listed there.\n\
+         The current candidate has {cluster_count} hotspot cluster(s).\n\
          Commit messages are intentionally withheld for this first-pass analysis.\n\
-         Do not rely on files outside this working directory.\n\
+         The actual provider runs happen inside each cluster bundle.\n",
+        prompt_input_path = prompt_input_path.display(),
+    )
+}
+
+/// Renders the Codex-specific prompt for one clustered screening pass.
+pub(crate) fn render_codex_screen_cluster_prompt(
+    cluster: &HotspotCluster,
+    prompt_input_path: &Path,
+) -> String {
+    format!(
+        "{SCREEN_COMMIT_TEMPLATE}\n\n\
+         All evidence for this screening cluster is available in the bundle referenced by\n\
+         `{prompt_input_path}`.\n\
+         Start with that `prompt-input.json` file.\n\
+         Analyze only hotspot cluster `{title}`.\n\
+         Cluster rationale: {rationale}\n\
+         Inspect the cluster patch and snapshots through the absolute file paths in that bundle.\n\
+         Commit messages are intentionally withheld for this first-pass analysis.\n\
+         If this cluster is security-relevant, return up to 2 distinct findings from this cluster.\n\
+         Prefer distinct hypotheses over near-duplicates when the cluster mixes several changed\n\
+         verification or parser functions.\n\
          Return a JSON object that matches the supplied schema.\n\
-         Use an empty suspicious_findings array when this commit does not look security-relevant.\n"
+         Use an empty suspicious_findings array when this cluster does not look security-relevant.\n",
+        title = cluster.title,
+        rationale = cluster.rationale,
+        prompt_input_path = prompt_input_path.display(),
     )
 }
 
@@ -142,28 +171,35 @@ pub(crate) fn render_verify_prompt(
 }
 
 /// Renders the Codex-specific second-pass verifier prompt for one commit candidate.
-pub(crate) fn render_codex_verify_prompt() -> String {
+pub(crate) fn render_codex_verify_prompt(prompt_input_path: &Path) -> String {
     format!(
         "{VERIFY_COMMIT_TEMPLATE}\n\n\
-         All evidence for this verification pass is available in the current working directory.\n\
-         Start with `prompt-input.json`.\n\
-         Then inspect the files it references under `evidence/`.\n\
-         Treat this pass directory as the full evidence bundle for the candidate.\n\
-         Use the commit message and screening hypothesis restored in `prompt-input.json` as\n\
+         All evidence for this verification pass is available in the bundle referenced by\n\
+         `{prompt_input_path}`.\n\
+         Start with that `prompt-input.json` file.\n\
+         Then inspect the absolute file paths it provides for the patch, hotspot plan, and\n\
+         snapshots.\n\
+         Use the commit message, hotspot plan, and screening hypothesis restored there as\n\
          secondary context.\n\
-         Do not rely on files outside this working directory.\n\
+         Challenge the strongest screened hypothesis first, but do not stop after rejecting it.\n\
+         If another hotspot cluster supports a stronger exploit explanation, replace the rejected\n\
+         hypothesis with that stronger alternative.\n\
          Return a JSON object that matches the supplied schema.\n\
-         Use an empty confirmed_findings array when the screener hypothesis does not hold up.\n"
+         Use an empty confirmed_findings array when the screener hypothesis does not hold up.\n",
+        prompt_input_path = prompt_input_path.display(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_prompt_input, build_verification_prompt_input, render_codex_screen_prompt,
-        render_codex_verify_prompt, render_screen_prompt, render_verify_prompt,
+        build_prompt_input, build_verification_prompt_input, render_codex_screen_cluster_prompt,
+        render_codex_screen_plan_prompt, render_codex_verify_prompt, render_screen_prompt,
+        render_verify_prompt,
     };
+    use crate::hotspot::HotspotCluster;
     use crate::types::{CommitCandidate, CommitRecord, FileStat, ScreeningAnalysis};
+    use std::path::Path;
 
     #[test]
     fn prompt_input_omits_commit_summary() {
@@ -224,13 +260,36 @@ mod tests {
     }
 
     #[test]
-    fn codex_screen_prompt_points_to_bundle_files() {
-        let prompt = render_codex_screen_prompt();
+    fn codex_screen_plan_prompt_points_to_cluster_bundles() {
+        let prompt = render_codex_screen_plan_prompt(3, Path::new("/tmp/bundle/prompt-input.json"));
 
-        assert!(prompt.contains("prompt-input.json"));
-        assert!(prompt.contains("evidence/"));
+        assert!(prompt.contains("/tmp/bundle/prompt-input.json"));
+        assert!(prompt.contains("3 hotspot cluster(s)"));
         assert!(prompt.contains("Commit messages are intentionally withheld"));
         assert!(!prompt.contains("Repository root:"));
+    }
+
+    #[test]
+    fn codex_screen_cluster_prompt_mentions_cluster_focus() {
+        let cluster = HotspotCluster {
+            cluster_index: 0,
+            title: "Digest-length checks on verification paths".into(),
+            rationale: "Look for caller-controlled digest-length guards in verification code."
+                .into(),
+            category: "digest_length_verify".into(),
+            files: vec!["src/pk_ec.c".into()],
+            function_hints: vec!["int wolfSSL_ECDSA_verify(...)".into()],
+            signal_terms: vec!["digest-length guard".into()],
+            score: 10,
+        };
+        let prompt = render_codex_screen_cluster_prompt(
+            &cluster,
+            Path::new("/tmp/cluster/prompt-input.json"),
+        );
+
+        assert!(prompt.contains("Analyze only hotspot cluster"));
+        assert!(prompt.contains("up to 2 distinct findings"));
+        assert!(prompt.contains("verification code"));
     }
 
     #[test]
@@ -269,11 +328,11 @@ mod tests {
 
     #[test]
     fn codex_verify_prompt_points_to_bundle_files() {
-        let prompt = render_codex_verify_prompt();
+        let prompt = render_codex_verify_prompt(Path::new("/tmp/verify/prompt-input.json"));
 
-        assert!(prompt.contains("prompt-input.json"));
-        assert!(prompt.contains("evidence/"));
+        assert!(prompt.contains("/tmp/verify/prompt-input.json"));
         assert!(prompt.contains("screening hypothesis"));
+        assert!(prompt.contains("do not stop after rejecting it"));
         assert!(!prompt.contains("Repository root:"));
     }
 }

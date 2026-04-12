@@ -27,6 +27,15 @@ Pay special attention to camouflage:
 - tests that quietly pin a stronger security property than the surrounding code churn suggests
 - a narrow guard, verifier, parser, or authorization change that looks like the real fix
 
+When a commit changes several independent verification, parser, or cryptographic code paths, inspect each cluster separately before you settle on a single explanation. Return up to 3 distinct findings when different clusters support different exploit stories.
+
+Treat these crypto-specific patterns as high-signal:
+
+- digest-length guards added to sign or verify APIs
+- feature-interaction checks across signature families or algorithm identifiers
+- new `BAD_LENGTH_E`, `ASN_SIG_OID_E`, or similar early rejects on verification paths
+- multiple changed verification functions in one commit, especially when some are public entry points and others are lower-level helpers
+
 For every finding, identify the attacker model explicitly. Examples: remote peer, unauthenticated caller, authenticated user, malicious proof sender, local operator, or internal-only caller. If you cannot name a plausible attacker and security property, do not report the finding.
 
 Analyze behavioral consequences, not only syntactic differences. Explain:

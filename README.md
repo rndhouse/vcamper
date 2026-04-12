@@ -62,7 +62,7 @@ By default, VCamper suppresses provider event output in the terminal. The defaul
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
-For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, and before/after snapshots for changed files. That keeps the screen pass closer to commit-local analysis and avoids losing diff context to prompt-size truncation.
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Screening now derives a ranked hotspot plan from the full patch, splits large commits into up to four hotspot clusters, and screens each cluster separately before merging the candidate-level hypotheses. That keeps the screen pass closer to commit-local analysis, avoids losing diff context to prompt-size truncation, and gives verification alternative hypotheses to test when the first explanation fails.
 
 VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`.
 
@@ -91,14 +91,19 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `candidate-*/screen/prompt.txt`: rendered screener prompt
 - `candidate-*/screen/evidence/patch.diff`: full untruncated patch for the screening pass
 - `candidate-*/screen/evidence/changed-files.txt`: changed file list for the screening pass
+- `candidate-*/screen/evidence/hotspots.json`: ranked hotspot files and screening clusters derived from the full patch
 - `candidate-*/screen/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
 - `candidate-*/screen/evidence/before/*` and `candidate-*/screen/evidence/after/*`: file snapshots available to Codex during screening
+- `candidate-*/screen/clusters/cluster-*/prompt-input.json` and `prompt.txt`: cluster-specific screener evidence and prompt
+- `candidate-*/screen/clusters/cluster-*/evidence/*`: filtered patch, hotspot plan, and snapshots for one screening cluster
+- `candidate-*/screen/clusters/cluster-*/analysis.json`: per-cluster screener result before candidate-level merging
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output
 - `candidate-*/screen/analysis.json`: completed screener result
 - `candidate-*/verify/prompt-input.json`: verifier evidence including the screener hypothesis and commit message
 - `candidate-*/verify/prompt.txt`: rendered verifier prompt
 - `candidate-*/verify/evidence/patch.diff`: full untruncated patch for the verification pass
 - `candidate-*/verify/evidence/changed-files.txt`: changed file list for the verification pass
+- `candidate-*/verify/evidence/hotspots.json`: hotspot plan reused during verification
 - `candidate-*/verify/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
 - `candidate-*/verify/evidence/before/*` and `candidate-*/verify/evidence/after/*`: file snapshots available to Codex during verification
 - `candidate-*/verify/stdout.txt` and `candidate-*/verify/stderr.txt`: verifier provider output

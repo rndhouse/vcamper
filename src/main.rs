@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod git;
+mod hotspot;
 mod prompt;
 mod provider;
 mod report;

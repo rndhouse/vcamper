@@ -1,6 +1,8 @@
 //! Application orchestration for the VCamper CLI.
 //! Ownership: client-only
 
+use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -11,6 +13,7 @@ use serde::Serialize;
 
 use crate::cli::{AnalyzeArgs, Cli, Commands, ProviderKind};
 use crate::git;
+use crate::hotspot::{self, HotspotCluster, HotspotPlan};
 use crate::prompt;
 use crate::provider::{
     AnalysisPhase, ProviderRequest, build_provider, screening_schema, verification_schema,
@@ -200,8 +203,27 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         let screen_dir = pass_dir(&wip_dir, AnalysisPhase::Screen);
         fs::create_dir_all(&screen_dir)
             .with_context(|| format!("failed to create {}", screen_dir.display()))?;
-        let screen_prompt =
-            prepare_screen_pass_artifacts(args.provider, &repo_root, &screen_dir, candidate)?;
+        let codex_screen_artifacts = match args.provider {
+            ProviderKind::Codex => Some(prepare_codex_screen_plan_artifacts(
+                &repo_root,
+                &screen_dir,
+                candidate,
+            )?),
+            ProviderKind::Claude => {
+                let screen_prompt = prepare_screen_pass_artifacts(
+                    args.provider,
+                    &repo_root,
+                    &screen_dir,
+                    candidate,
+                )?;
+                persist_pass_artifacts(
+                    &screen_dir,
+                    &prompt::build_prompt_input(candidate),
+                    &screen_prompt,
+                )?;
+                None
+            }
+        };
 
         if args.dry_run {
             log_step(
@@ -248,17 +270,31 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 manifest.provider, candidate.candidate_index
             ),
         );
-        let screening = provider.screen_candidate(ProviderRequest {
-            working_dir: &screen_dir,
-            prompt: &screen_prompt,
-            schema: &screen_schema,
-            pass_dir: &screen_dir,
-            candidate_index: candidate.candidate_index,
-            phase: AnalysisPhase::Screen,
-            model: args.model.as_deref(),
-            effort: screen_effort,
-            verbose,
-        })?;
+        let screening = if let Some(screen_artifacts) = &codex_screen_artifacts {
+            run_codex_screening(
+                provider.as_ref(),
+                screen_artifacts,
+                &repo_root,
+                &screen_schema,
+                candidate.candidate_index,
+                args.model.as_deref(),
+                screen_effort,
+                verbose,
+            )?
+        } else {
+            let screen_prompt = prompt::render_screen_prompt(&manifest.repo_root, candidate)?;
+            provider.screen_candidate(ProviderRequest {
+                working_dir: &screen_dir,
+                prompt: &screen_prompt,
+                schema: &screen_schema,
+                pass_dir: &screen_dir,
+                candidate_index: candidate.candidate_index,
+                phase: AnalysisPhase::Screen,
+                model: args.model.as_deref(),
+                effort: screen_effort,
+                verbose,
+            })?
+        };
         log_step(
             verbose,
             "candidate",
@@ -298,7 +334,11 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 ),
             );
             let verification = provider.verify_candidate(ProviderRequest {
-                working_dir: &verify_dir,
+                working_dir: if matches!(args.provider, ProviderKind::Codex) {
+                    &repo_root
+                } else {
+                    &verify_dir
+                },
                 prompt: &verify_prompt,
                 schema: &verify_schema,
                 pass_dir: &verify_dir,
@@ -549,12 +589,22 @@ struct CodexPromptCommit {
     patch_file: String,
     changed_files_file: String,
     snapshot_manifest_file: String,
+    hotspot_plan_file: String,
 }
 
 #[derive(Debug, Serialize)]
-struct CodexScreenPromptInput {
+struct CodexScreenPlanPromptInput {
     candidate_index: usize,
     commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexScreenClusterPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+    cluster: HotspotCluster,
 }
 
 #[derive(Debug, Serialize)]
@@ -562,6 +612,7 @@ struct CodexVerifyPromptInput {
     candidate_index: usize,
     commit: CodexPromptCommit,
     commit_message: String,
+    hotspot_plan: HotspotPlan,
     screening_hypothesis: ScreeningAnalysis,
 }
 
@@ -577,6 +628,20 @@ struct CodexEvidenceRefs {
     patch_file: String,
     changed_files_file: String,
     snapshot_manifest_file: String,
+    hotspot_plan_file: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexScreenClusterArtifacts {
+    cluster: HotspotCluster,
+    pass_dir: PathBuf,
+    prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexScreenPlanArtifacts {
+    hotspot_plan: HotspotPlan,
+    clusters: Vec<CodexScreenClusterArtifacts>,
 }
 
 /// Prepares one screening-pass prompt and pass artifacts for the selected provider.
@@ -588,16 +653,16 @@ fn prepare_screen_pass_artifacts(
 ) -> Result<String> {
     match provider {
         ProviderKind::Codex => {
-            let prompt_input = build_codex_screen_prompt_input(repo_root, pass_dir, candidate)?;
-            let prompt = prompt::render_codex_screen_prompt();
-            persist_pass_artifacts(pass_dir, &prompt_input, &prompt)?;
-            Ok(prompt)
+            let artifacts = prepare_codex_screen_plan_artifacts(repo_root, pass_dir, candidate)?;
+            let prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
+            Ok(prompt::render_codex_screen_plan_prompt(
+                artifacts.hotspot_plan.clusters.len(),
+                Path::new(&prompt_input_path),
+            ))
         }
         ProviderKind::Claude => {
             let repo_root = repo_root.display().to_string();
-            let prompt = prompt::render_screen_prompt(&repo_root, candidate)?;
-            persist_pass_artifacts(pass_dir, &prompt::build_prompt_input(candidate), &prompt)?;
-            Ok(prompt)
+            prompt::render_screen_prompt(&repo_root, candidate)
         }
     }
 }
@@ -614,7 +679,8 @@ fn prepare_verify_pass_artifacts(
         ProviderKind::Codex => {
             let prompt_input =
                 build_codex_verify_prompt_input(repo_root, pass_dir, candidate, screening)?;
-            let prompt = prompt::render_codex_verify_prompt();
+            let prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
+            let prompt = prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
             persist_pass_artifacts(pass_dir, &prompt_input, &prompt)?;
             Ok(prompt)
         }
@@ -631,18 +697,163 @@ fn prepare_verify_pass_artifacts(
     }
 }
 
-/// Builds the Codex screening-pass prompt input after persisting a pass-local evidence bundle.
-fn build_codex_screen_prompt_input(
+/// Prepares one clustered Codex screening plan and its evidence bundles.
+fn prepare_codex_screen_plan_artifacts(
     repo_root: &Path,
     pass_dir: &Path,
     candidate: &CommitCandidate,
-) -> Result<CodexScreenPromptInput> {
-    let evidence = persist_codex_evidence_bundle(pass_dir, repo_root, candidate)?;
-
-    Ok(CodexScreenPromptInput {
+) -> Result<CodexScreenPlanArtifacts> {
+    let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
+    let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
+    let evidence = persist_codex_evidence_bundle(
+        pass_dir,
+        repo_root,
+        candidate,
+        &candidate.commit.files_changed,
+        &full_patch,
+        &hotspot_plan,
+    )?;
+    let plan_prompt_input = CodexScreenPlanPromptInput {
         candidate_index: candidate.candidate_index,
         commit: build_codex_prompt_commit(candidate, evidence),
+        hotspot_plan: hotspot_plan.clone(),
+    };
+    let plan_prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
+    let plan_prompt = prompt::render_codex_screen_plan_prompt(
+        hotspot_plan.clusters.len(),
+        Path::new(&plan_prompt_input_path),
+    );
+    persist_pass_artifacts(pass_dir, &plan_prompt_input, &plan_prompt)?;
+
+    let mut clusters = Vec::with_capacity(hotspot_plan.clusters.len());
+    for cluster in &hotspot_plan.clusters {
+        let cluster_dir = pass_dir
+            .join("clusters")
+            .join(format!("cluster-{:04}", cluster.cluster_index));
+        fs::create_dir_all(&cluster_dir)
+            .with_context(|| format!("failed to create {}", cluster_dir.display()))?;
+        let filtered_patch = hotspot::filtered_patch_for_files(&full_patch, &cluster.files);
+        let evidence = persist_codex_evidence_bundle(
+            &cluster_dir,
+            repo_root,
+            candidate,
+            &cluster.files,
+            &filtered_patch,
+            &hotspot_plan,
+        )?;
+        let prompt_input = CodexScreenClusterPromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            hotspot_plan: hotspot_plan.clone(),
+            cluster: cluster.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&cluster_dir.join("prompt-input.json"))?;
+        let prompt =
+            prompt::render_codex_screen_cluster_prompt(cluster, Path::new(&prompt_input_path));
+        persist_pass_artifacts(&cluster_dir, &prompt_input, &prompt)?;
+        clusters.push(CodexScreenClusterArtifacts {
+            cluster: cluster.clone(),
+            pass_dir: cluster_dir,
+            prompt,
+        });
+    }
+
+    Ok(CodexScreenPlanArtifacts {
+        hotspot_plan,
+        clusters,
     })
+}
+
+/// Runs Codex screening across hotspot clusters and merges the results.
+fn run_codex_screening(
+    provider: &dyn crate::provider::AgentProvider,
+    artifacts: &CodexScreenPlanArtifacts,
+    working_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<ScreeningAnalysis> {
+    let mut cluster_results = Vec::with_capacity(artifacts.clusters.len());
+    for cluster_artifact in &artifacts.clusters {
+        log_step(
+            verbose,
+            "screen-cluster",
+            format!(
+                "screening cluster {:04} ({})",
+                cluster_artifact.cluster.cluster_index, cluster_artifact.cluster.title
+            ),
+        );
+        let analysis = provider.screen_candidate(ProviderRequest {
+            working_dir,
+            prompt: &cluster_artifact.prompt,
+            schema,
+            pass_dir: &cluster_artifact.pass_dir,
+            candidate_index,
+            phase: AnalysisPhase::Screen,
+            model,
+            effort,
+            verbose,
+        })?;
+        persist_screening_analysis(&cluster_artifact.pass_dir, &analysis)?;
+        cluster_results.push((cluster_artifact.cluster.clone(), analysis));
+    }
+
+    Ok(merge_codex_screening_results(
+        artifacts.hotspot_plan.clusters.len(),
+        cluster_results,
+    ))
+}
+
+/// Merges clustered Codex screening results into one candidate-level analysis.
+fn merge_codex_screening_results(
+    cluster_count: usize,
+    cluster_results: Vec<(HotspotCluster, ScreeningAnalysis)>,
+) -> ScreeningAnalysis {
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut positive_clusters = Vec::new();
+
+    for (cluster, analysis) in &cluster_results {
+        if !analysis.suspicious_findings.is_empty() {
+            positive_clusters.push(cluster.title.clone());
+        }
+
+        for finding in &analysis.suspicious_findings {
+            let key = format!(
+                "{}|{}|{}",
+                finding.commit_id.to_ascii_lowercase(),
+                finding.title.to_ascii_lowercase(),
+                finding
+                    .likely_bug_class
+                    .clone()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+            );
+            if seen.insert(key) {
+                findings.push(finding.clone());
+            }
+        }
+    }
+
+    let candidate_summary = if positive_clusters.is_empty() {
+        format!(
+            "Screened {} hotspot cluster(s). No cluster produced a stable security hypothesis from the supplied evidence.",
+            cluster_count
+        )
+    } else {
+        format!(
+            "Screened {} hotspot cluster(s). Plausible security hypotheses came from: {}.",
+            cluster_count,
+            positive_clusters.join("; ")
+        )
+    };
+
+    ScreeningAnalysis {
+        candidate_summary,
+        suspicious_findings: findings,
+    }
 }
 
 /// Builds the Codex verification-pass prompt input after persisting a pass-local evidence bundle.
@@ -652,12 +863,21 @@ fn build_codex_verify_prompt_input(
     candidate: &CommitCandidate,
     screening: &ScreeningAnalysis,
 ) -> Result<CodexVerifyPromptInput> {
-    let evidence = persist_codex_evidence_bundle(pass_dir, repo_root, candidate)?;
-
+    let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
+    let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
+    let evidence = persist_codex_evidence_bundle(
+        pass_dir,
+        repo_root,
+        candidate,
+        &candidate.commit.files_changed,
+        &full_patch,
+        &hotspot_plan,
+    )?;
     Ok(CodexVerifyPromptInput {
         candidate_index: candidate.candidate_index,
         commit: build_codex_prompt_commit(candidate, evidence),
         commit_message: candidate.commit.summary.clone(),
+        hotspot_plan,
         screening_hypothesis: screening.clone(),
     })
 }
@@ -676,37 +896,43 @@ fn build_codex_prompt_commit(
         patch_file: evidence.patch_file,
         changed_files_file: evidence.changed_files_file,
         snapshot_manifest_file: evidence.snapshot_manifest_file,
+        hotspot_plan_file: evidence.hotspot_plan_file,
     }
 }
 
-/// Persists the Codex evidence bundle for one pass with a full patch and per-file snapshots.
+/// Persists the Codex evidence bundle for one pass with a patch subset and per-file snapshots.
 fn persist_codex_evidence_bundle(
     pass_dir: &Path,
     repo_root: &Path,
     candidate: &CommitCandidate,
+    selected_files: &[String],
+    patch_text: &str,
+    hotspot_plan: &HotspotPlan,
 ) -> Result<CodexEvidenceRefs> {
     let evidence_dir = pass_dir.join("evidence");
     fs::create_dir_all(&evidence_dir)
         .with_context(|| format!("failed to create {}", evidence_dir.display()))?;
 
     let patch_path = evidence_dir.join("patch.diff");
-    fs::write(
-        &patch_path,
-        git::load_full_patch(repo_root, &candidate.commit.id)?,
-    )
-    .with_context(|| format!("failed to write {}", patch_path.display()))?;
+    fs::write(&patch_path, patch_text)
+        .with_context(|| format!("failed to write {}", patch_path.display()))?;
 
     let changed_files_path = evidence_dir.join("changed-files.txt");
-    let changed_files = if candidate.commit.files_changed.is_empty() {
+    let changed_files = if selected_files.is_empty() {
         String::new()
     } else {
-        format!("{}\n", candidate.commit.files_changed.join("\n"))
+        format!("{}\n", selected_files.join("\n"))
     };
     fs::write(&changed_files_path, changed_files)
         .with_context(|| format!("failed to write {}", changed_files_path.display()))?;
 
+    let hotspot_path = evidence_dir.join("hotspots.json");
+    fs::write(&hotspot_path, serde_json::to_string_pretty(hotspot_plan)?)
+        .with_context(|| format!("failed to write {}", hotspot_path.display()))?;
+
     let snapshot_manifest_path = evidence_dir.join("file-snapshots.json");
-    let snapshots = persist_codex_file_snapshots(&evidence_dir, repo_root, candidate)?;
+    let snapshots =
+        persist_codex_file_snapshots(&evidence_dir, repo_root, candidate, selected_files)?;
     fs::write(
         &snapshot_manifest_path,
         serde_json::to_string_pretty(&snapshots)?,
@@ -714,42 +940,32 @@ fn persist_codex_evidence_bundle(
     .with_context(|| format!("failed to write {}", snapshot_manifest_path.display()))?;
 
     Ok(CodexEvidenceRefs {
-        patch_file: "evidence/patch.diff".to_owned(),
-        changed_files_file: "evidence/changed-files.txt".to_owned(),
-        snapshot_manifest_file: "evidence/file-snapshots.json".to_owned(),
+        patch_file: absolute_artifact_path(&patch_path)?,
+        changed_files_file: absolute_artifact_path(&changed_files_path)?,
+        snapshot_manifest_file: absolute_artifact_path(&snapshot_manifest_path)?,
+        hotspot_plan_file: absolute_artifact_path(&hotspot_path)?,
     })
 }
 
-/// Persists before/after snapshots for changed files inside one Codex evidence bundle.
+/// Persists before/after snapshots for selected files inside one Codex evidence bundle.
 fn persist_codex_file_snapshots(
     evidence_dir: &Path,
     repo_root: &Path,
     candidate: &CommitCandidate,
+    selected_files: &[String],
 ) -> Result<Vec<CodexSnapshotEntry>> {
     let before_root = evidence_dir.join("before");
     let after_root = evidence_dir.join("after");
     let parent_revision = candidate.commit.parent_ids.first().map(String::as_str);
-    let mut snapshots = Vec::with_capacity(candidate.commit.files_changed.len());
+    let mut snapshots = Vec::with_capacity(selected_files.len());
 
-    for path in &candidate.commit.files_changed {
+    for path in selected_files {
         let before_file = if let Some(parent_revision) = parent_revision {
-            persist_snapshot_file(
-                repo_root,
-                parent_revision,
-                path,
-                &before_root,
-                "evidence/before",
-            )?
+            persist_snapshot_file(repo_root, parent_revision, path, &before_root)?
         } else {
             None
         };
-        let after_file = persist_snapshot_file(
-            repo_root,
-            &candidate.commit.id,
-            path,
-            &after_root,
-            "evidence/after",
-        )?;
+        let after_file = persist_snapshot_file(repo_root, &candidate.commit.id, path, &after_root)?;
         snapshots.push(CodexSnapshotEntry {
             path: path.clone(),
             before_file,
@@ -766,7 +982,6 @@ fn persist_snapshot_file(
     revision: &str,
     repo_relative_path: &str,
     snapshot_root: &Path,
-    snapshot_label: &str,
 ) -> Result<Option<String>> {
     let Some(contents) = git::load_file_at_revision(repo_root, revision, repo_relative_path)?
     else {
@@ -781,7 +996,21 @@ fn persist_snapshot_file(
     fs::write(&snapshot_path, contents)
         .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
 
-    Ok(Some(format!("{snapshot_label}/{repo_relative_path}")))
+    Ok(Some(absolute_artifact_path(&snapshot_path)?))
+}
+
+/// Returns one artifact path in absolute display form for prompt-input references.
+fn absolute_artifact_path(path: &Path) -> Result<String> {
+    let absolute = if path.exists() {
+        fs::canonicalize(path).with_context(|| format!("failed to resolve {}", path.display()))?
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve current working directory")?
+            .join(path)
+    };
+    Ok(absolute.display().to_string())
 }
 
 /// Resolves one repo-relative path inside the evidence bundle snapshot tree.
@@ -1272,8 +1501,9 @@ impl ProgressUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_snapshot_path, ensure_manifest, initialize_progress_state, load_progress_state,
-        load_saved_candidate_outcome, persist_candidate_outcome, validate_args,
+        absolute_artifact_path, bundle_snapshot_path, ensure_manifest, initialize_progress_state,
+        load_progress_state, load_saved_candidate_outcome, persist_candidate_outcome,
+        validate_args,
     };
     use crate::cli::{AnalyzeArgs, ProviderKind};
     use crate::types::{
@@ -1417,6 +1647,16 @@ mod tests {
     #[test]
     fn bundle_snapshot_path_rejects_parent_traversal() {
         assert!(bundle_snapshot_path(Path::new("/tmp/bundle"), "../secret").is_err());
+    }
+
+    #[test]
+    fn absolute_artifact_path_resolves_nonexistent_relative_paths() {
+        let relative = Path::new(".tmp/tests/nonexistent/prompt-input.json");
+        let resolved =
+            absolute_artifact_path(relative).expect("relative artifact path should resolve");
+
+        assert!(resolved.starts_with('/'));
+        assert!(resolved.ends_with(".tmp/tests/nonexistent/prompt-input.json"));
     }
 
     fn sample_manifest(provider: &str) -> RunManifest {
