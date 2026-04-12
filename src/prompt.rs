@@ -10,6 +10,7 @@ use crate::hotspot::HotspotCluster;
 use crate::types::{CommitCandidate, FileStat, ScreeningAnalysis};
 
 const SCREEN_COMMIT_TEMPLATE: &str = include_str!("../prompts/analyze_commit.md");
+const INTERACTION_TEMPLATE: &str = include_str!("../prompts/interaction_commit.md");
 const REACHABILITY_TEMPLATE: &str = include_str!("../prompts/reachability_commit.md");
 const VERIFY_COMMIT_TEMPLATE: &str = include_str!("../prompts/verify_commit.md");
 
@@ -113,14 +114,14 @@ pub(crate) fn render_codex_screen_plan_prompt(
 ) -> String {
     format!(
         "{SCREEN_COMMIT_TEMPLATE}\n\n\
-         This screening pass is the inventory stage of a clustered analysis.\n\
+         This screening pass is the inventory stage of a focused staged analysis.\n\
          Start with `{prompt_input_path}` to review the hotspot plan.\n\
-         Then inspect the cluster-specific bundles listed there.\n\
-         The current candidate has {cluster_count} hotspot cluster(s).\n\
+         Then inspect the focus-specific bundles listed there.\n\
+         The current candidate has {cluster_count} hotspot focus unit(s).\n\
          Commit messages are intentionally withheld for this first-pass analysis.\n\
-         The actual provider runs happen inside each cluster bundle.\n\
-         The goal of this stage is breadth. Inventory distinct security hypotheses without trying\n\
-         to settle which one is strongest overall.\n",
+         The actual provider runs happen inside each focus bundle.\n\
+         The goal of this stage is isolation. Each focus run should concentrate on one local code\n\
+         story at a time instead of forcing multiple theories to compete in one prompt.\n",
         prompt_input_path = prompt_input_path.display(),
     )
 }
@@ -132,20 +133,36 @@ pub(crate) fn render_codex_screen_cluster_prompt(
 ) -> String {
     format!(
         "{SCREEN_COMMIT_TEMPLATE}\n\n\
-         All evidence for this inventory cluster is available in the bundle referenced by\n\
+         All evidence for this inventory focus unit is available in the bundle referenced by\n\
          `{prompt_input_path}`.\n\
          Start with that `prompt-input.json` file.\n\
-         Analyze only hotspot cluster `{title}`.\n\
-         Cluster rationale: {rationale}\n\
-         Inspect the cluster patch and snapshots through the absolute file paths in that bundle.\n\
+         Analyze only hotspot focus `{title}`.\n\
+         Focus rationale: {rationale}\n\
+         Inspect the focus patch and snapshots through the absolute file paths in that bundle.\n\
          Commit messages are intentionally withheld for this first-pass analysis.\n\
-         Return all materially distinct hypotheses from this cluster that have concrete code\n\
-         evidence. Prefer breadth over early adjudication, but drop near-duplicates and keep the\n\
-         response compact.\n\
+         Return at most one primary suspicious finding from this focus unit.\n\
+         Do not include competing alternatives or near-duplicate hypotheses in the same response.\n\
          Return a JSON object that matches the supplied schema.\n\
-         Use an empty suspicious_findings array when this cluster does not look security-relevant.\n",
+         Use an empty suspicious_findings array when this focus does not look security-relevant.\n",
         title = cluster.title,
         rationale = cluster.rationale,
+        prompt_input_path = prompt_input_path.display(),
+    )
+}
+
+/// Renders the Codex-specific reachability prompt for one screened hypothesis.
+pub(crate) fn render_codex_interaction_prompt(prompt_input_path: &Path) -> String {
+    format!(
+        "{INTERACTION_TEMPLATE}\n\n\
+         All evidence for this interaction review is available in the bundle referenced by\n\
+         `{prompt_input_path}`.\n\
+         Start with that `prompt-input.json` file.\n\
+         Inspect the absolute file paths it provides for the hypothesis-local patch subset,\n\
+         hotspot plan, and before/after snapshots.\n\
+         Focus on whether this hypothesis depends on feature interaction, shared verification\n\
+         flows, or compile-time algorithm-family combinations that later reachability review could\n\
+         underappreciate.\n\
+         Return a JSON object that matches the supplied schema.\n",
         prompt_input_path = prompt_input_path.display(),
     )
 }
@@ -159,10 +176,19 @@ pub(crate) fn render_codex_reachability_prompt(prompt_input_path: &Path) -> Stri
          Start with that `prompt-input.json` file.\n\
          Inspect the absolute file paths it provides for the hypothesis-local patch subset,\n\
          hotspot plan, and before/after snapshots.\n\
+         Use the supplied interaction review as prior context.\n\
          Treat the supplied finding as a claim to test, not a conclusion to repeat.\n\
+         Do not reject a crypto-verification hypothesis solely because some visible callers derive\n\
+         digest sizes internally. When several changed helpers tighten the same invariant across\n\
+         verification families, prefer `assessment=interaction_dependent` over collapsing the case\n\
+         into plain `local_api_only` unless the supplied code clearly disproves the shared-flow\n\
+         theory.\n\
          Return a JSON object that matches the supplied schema.\n\
-         Use `rejected` with `refined_finding: null` when the hypothesis does not survive\n\
-         attacker-path review.\n",
+         Use `assessment=interaction_dependent` and `keep_for_adjudication=true` when the direct\n\
+         attacker path stays weak but the interaction review still supports a plausible crypto\n\
+         interaction or shared verification-flow theory.\n\
+         Use `rejected` with `refined_finding: null` only when the hypothesis does not survive\n\
+         either direct reachability or interaction-aware review.\n",
         prompt_input_path = prompt_input_path.display(),
     )
 }
@@ -202,6 +228,13 @@ pub(crate) fn render_codex_verify_prompt(prompt_input_path: &Path) -> String {
          Use the commit message as secondary context.\n\
          Compare the shortlisted finalists head-to-head and pick the strongest supported security\n\
          story, or reject them all.\n\
+         Some finalists may remain because interaction review kept them alive despite weak direct\n\
+         reachability. Evaluate those explicitly instead of dismissing them as mere local API\n\
+         hardening by reflex.\n\
+         When a plain local-API bug and an interaction-dependent verification theory are both\n\
+         plausible, prefer the interaction-dependent theory only if the code evidence shows a\n\
+         stronger trust-boundary consequence or a shared certificate or signed-object validation\n\
+         path.\n\
          Do not union all finalists into the output. Prefer one winner, or none, when several\n\
          hypotheses describe the same commit from different angles.\n\
          Return a JSON object that matches the supplied schema.\n\
@@ -213,9 +246,10 @@ pub(crate) fn render_codex_verify_prompt(prompt_input_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_prompt_input, build_verification_prompt_input, render_codex_reachability_prompt,
-        render_codex_screen_cluster_prompt, render_codex_screen_plan_prompt,
-        render_codex_verify_prompt, render_screen_prompt, render_verify_prompt,
+        build_prompt_input, build_verification_prompt_input, render_codex_interaction_prompt,
+        render_codex_reachability_prompt, render_codex_screen_cluster_prompt,
+        render_codex_screen_plan_prompt, render_codex_verify_prompt, render_screen_prompt,
+        render_verify_prompt,
     };
     use crate::hotspot::HotspotCluster;
     use crate::types::{CommitCandidate, CommitRecord, FileStat, ScreeningAnalysis};
@@ -284,7 +318,7 @@ mod tests {
         let prompt = render_codex_screen_plan_prompt(3, Path::new("/tmp/bundle/prompt-input.json"));
 
         assert!(prompt.contains("/tmp/bundle/prompt-input.json"));
-        assert!(prompt.contains("3 hotspot cluster(s)"));
+        assert!(prompt.contains("3 hotspot focus unit(s)"));
         assert!(prompt.contains("Commit messages are intentionally withheld"));
         assert!(prompt.contains("inventory stage"));
         assert!(!prompt.contains("Repository root:"));
@@ -308,8 +342,8 @@ mod tests {
             Path::new("/tmp/cluster/prompt-input.json"),
         );
 
-        assert!(prompt.contains("Analyze only hotspot cluster"));
-        assert!(prompt.contains("materially distinct hypotheses"));
+        assert!(prompt.contains("Analyze only hotspot focus"));
+        assert!(prompt.contains("at most one primary suspicious finding"));
         assert!(prompt.contains("verification code"));
     }
 
@@ -319,8 +353,19 @@ mod tests {
             render_codex_reachability_prompt(Path::new("/tmp/reachability/prompt-input.json"));
 
         assert!(prompt.contains("/tmp/reachability/prompt-input.json"));
-        assert!(prompt.contains("claim to test"));
+        assert!(prompt.contains("interaction review as prior context"));
+        assert!(prompt.contains("assessment=interaction_dependent"));
         assert!(prompt.contains("refined_finding: null"));
+    }
+
+    #[test]
+    fn codex_interaction_prompt_points_to_bundle_files() {
+        let prompt =
+            render_codex_interaction_prompt(Path::new("/tmp/interaction/prompt-input.json"));
+
+        assert!(prompt.contains("/tmp/interaction/prompt-input.json"));
+        assert!(prompt.contains("interaction review"));
+        assert!(prompt.contains("shared verification"));
     }
 
     #[test]
@@ -363,6 +408,7 @@ mod tests {
 
         assert!(prompt.contains("/tmp/verify/prompt-input.json"));
         assert!(prompt.contains("adjudication finalists"));
+        assert!(prompt.contains("interaction review kept them alive"));
         assert!(prompt.contains("one winner, or none"));
         assert!(!prompt.contains("Repository root:"));
     }

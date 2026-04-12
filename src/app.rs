@@ -11,18 +11,19 @@ use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
-use crate::cli::{AnalyzeArgs, Cli, Commands, ProviderKind};
+use crate::cli::{AnalyzeArgs, Cli, Commands, PipelineStage, ProviderKind};
 use crate::git;
 use crate::hotspot::{self, HotspotCluster, HotspotPlan};
 use crate::prompt;
 use crate::provider::{
-    AnalysisPhase, ProviderRequest, build_provider, reachability_schema, screening_schema,
-    verification_schema,
+    AnalysisPhase, ProviderRequest, build_provider, interaction_schema, reachability_schema,
+    screening_schema, verification_schema,
 };
 use crate::report;
 use crate::types::{
-    CandidateOutcome, CommitCandidate, FileStat, ProgressCompleteCandidate,
-    ProgressPendingCandidate, ProgressResult, ProgressState, ProgressStatus, ReachabilityAnalysis,
+    CandidateOutcome, CommitCandidate, FileStat, InteractionAnalysis, InteractionKind,
+    InteractionVerdict, ProgressCompleteCandidate, ProgressPendingCandidate, ProgressResult,
+    ProgressState, ProgressStatus, ReachabilityAnalysis, ReachabilityAssessment,
     ReachabilitySurface, ReachabilityVerdict, RunManifest, ScreeningAnalysis, SuspiciousFinding,
     VerificationAnalysis,
 };
@@ -96,6 +97,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         commit_count: commits.len(),
         max_patch_bytes: args.max_patch_bytes,
         dry_run: args.dry_run,
+        stop_after_stage: args.stop_after_stage.map(|stage| stage.as_str().to_owned()),
     };
     ensure_manifest(&run_dir, &manifest, verbose)?;
     log_step(
@@ -128,6 +130,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     initialize_progress_state(&run_dir, &candidates)?;
 
     let screen_schema = screening_schema()?;
+    let interaction_review_schema = interaction_schema()?;
     let reachability_review_schema = reachability_schema()?;
     let verify_schema = verification_schema()?;
     let provider = build_provider(args.provider);
@@ -294,9 +297,11 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 screen_artifacts,
                 &run_dir,
                 &screen_schema,
+                &interaction_review_schema,
                 &reachability_review_schema,
                 args.model.as_deref(),
                 screen_effort,
+                args.stop_after_stage,
                 verbose,
             )?)
         } else {
@@ -329,7 +334,13 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         );
         persist_screening_analysis(&screen_dir, &screening)?;
 
-        let verification = if screening.suspicious_findings.is_empty() {
+        let verification = if screening.suspicious_findings.is_empty()
+            || matches!(
+                args.stop_after_stage,
+                Some(PipelineStage::Inventory)
+                    | Some(PipelineStage::Interaction)
+                    | Some(PipelineStage::Reachability)
+            ) {
             None
         } else {
             let verify_dir = pass_dir(&wip_dir, AnalysisPhase::Verify);
@@ -482,6 +493,9 @@ fn validate_args(args: &AnalyzeArgs) -> Result<()> {
     if !(0.0..=1.0).contains(&args.min_confidence) {
         bail!("--min-confidence must be between 0.0 and 1.0");
     }
+    if args.stop_after_stage.is_some() && !matches!(args.provider, ProviderKind::Codex) {
+        bail!("--stop-after-stage is currently supported only with --provider codex");
+    }
     Ok(())
 }
 
@@ -619,6 +633,13 @@ fn persist_reachability_analysis(pass_dir: &Path, analysis: &ReachabilityAnalysi
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Persists one interaction analysis for a screened hypothesis.
+fn persist_interaction_analysis(pass_dir: &Path, analysis: &InteractionAnalysis) -> Result<()> {
+    let path = pass_dir.join("analysis.json");
+    fs::write(&path, serde_json::to_string_pretty(analysis)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Persists one completed candidate outcome.
 fn persist_candidate_outcome(candidate_dir: &Path, outcome: &CandidateOutcome) -> Result<()> {
     let path = candidate_dir.join("outcome.json");
@@ -688,7 +709,7 @@ struct CodexInventoryClusterPromptInput {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexReachabilityPromptInput {
+struct CodexInteractionPromptInput {
     candidate_index: usize,
     commit: CodexPromptCommit,
     hotspot_plan: HotspotPlan,
@@ -696,12 +717,27 @@ struct CodexReachabilityPromptInput {
     inventory_hypothesis: SuspiciousFinding,
 }
 
+#[derive(Debug, Serialize)]
+struct CodexReachabilityPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+    cluster: HotspotCluster,
+    inventory_hypothesis: SuspiciousFinding,
+    interaction_review: InteractionAnalysis,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CodexAdjudicationCandidate {
     hypothesis_index: usize,
     cluster_title: String,
+    cluster_category: String,
+    interaction_summary: String,
+    interaction_verdict: InteractionVerdict,
+    interaction_kind: InteractionKind,
     reachability_summary: String,
     reachability_verdict: ReachabilityVerdict,
+    reachability_assessment: ReachabilityAssessment,
     surface: ReachabilitySurface,
     preconditions: Vec<String>,
     refined_finding: SuspiciousFinding,
@@ -753,9 +789,27 @@ struct CodexInventoryHypothesis {
 }
 
 #[derive(Debug, Clone)]
+struct CodexInteractionArtifacts {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    inventory_finding: SuspiciousFinding,
+    pass_dir: PathBuf,
+    prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexInteractionRecord {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    inventory_finding: SuspiciousFinding,
+    analysis: InteractionAnalysis,
+}
+
+#[derive(Debug, Clone)]
 struct CodexReachabilityArtifacts {
     hypothesis_index: usize,
     cluster: HotspotCluster,
+    interaction_review: InteractionAnalysis,
     pass_dir: PathBuf,
     prompt: String,
 }
@@ -764,6 +818,7 @@ struct CodexReachabilityArtifacts {
 struct CodexReachabilityRecord {
     hypothesis_index: usize,
     cluster: HotspotCluster,
+    interaction_analysis: InteractionAnalysis,
     analysis: ReachabilityAnalysis,
 }
 
@@ -792,7 +847,7 @@ fn prepare_screen_pass_artifacts(
             let artifacts = prepare_codex_screen_plan_artifacts(repo_root, pass_dir, candidate)?;
             let prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
             Ok(prompt::render_codex_screen_plan_prompt(
-                artifacts.hotspot_plan.clusters.len(),
+                artifacts.clusters.len(),
                 Path::new(&prompt_input_path),
             ))
         }
@@ -836,7 +891,35 @@ fn reachability_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("reachability")
 }
 
-/// Prepares one clustered Codex inventory plan and its evidence bundles.
+/// Returns the interaction-stage artifact root for one screen pass.
+fn interaction_stage_dir(screen_dir: &Path) -> PathBuf {
+    screen_dir.join("interaction")
+}
+
+/// Builds the inventory focus units used for isolated first-stage Codex runs.
+fn build_inventory_focuses(hotspot_plan: &HotspotPlan) -> Vec<HotspotCluster> {
+    if hotspot_plan.files.is_empty() {
+        return hotspot_plan.clusters.clone();
+    }
+
+    hotspot_plan
+        .files
+        .iter()
+        .enumerate()
+        .map(|(cluster_index, file)| HotspotCluster {
+            cluster_index,
+            title: format!("{} [{}]", file.path, file.category),
+            rationale: file.rationale.clone(),
+            category: file.category.clone(),
+            files: vec![file.path.clone()],
+            function_hints: file.function_hints.clone(),
+            signal_terms: file.signal_terms.clone(),
+            score: file.score,
+        })
+        .collect()
+}
+
+/// Prepares one focused Codex inventory plan and its evidence bundles.
 fn prepare_codex_screen_plan_artifacts(
     repo_root: &Path,
     screen_dir: &Path,
@@ -844,6 +927,7 @@ fn prepare_codex_screen_plan_artifacts(
 ) -> Result<CodexInventoryPlanArtifacts> {
     let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
     let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
+    let inventory_focuses = build_inventory_focuses(&hotspot_plan);
     let evidence = persist_codex_evidence_bundle(
         screen_dir,
         repo_root,
@@ -859,7 +943,7 @@ fn prepare_codex_screen_plan_artifacts(
     };
     let plan_prompt_input_path = absolute_artifact_path(&screen_dir.join("prompt-input.json"))?;
     let plan_prompt = prompt::render_codex_screen_plan_prompt(
-        hotspot_plan.clusters.len(),
+        inventory_focuses.len(),
         Path::new(&plan_prompt_input_path),
     );
     persist_pass_artifacts(screen_dir, &plan_prompt_input, &plan_prompt)?;
@@ -867,8 +951,8 @@ fn prepare_codex_screen_plan_artifacts(
     let inventory_dir = inventory_stage_dir(screen_dir);
     fs::create_dir_all(&inventory_dir)
         .with_context(|| format!("failed to create {}", inventory_dir.display()))?;
-    let mut clusters = Vec::with_capacity(hotspot_plan.clusters.len());
-    for cluster in &hotspot_plan.clusters {
+    let mut clusters = Vec::with_capacity(inventory_focuses.len());
+    for cluster in &inventory_focuses {
         let cluster_dir = inventory_dir.join(format!("cluster-{:04}", cluster.cluster_index));
         fs::create_dir_all(&cluster_dir)
             .with_context(|| format!("failed to create {}", cluster_dir.display()))?;
@@ -914,9 +998,11 @@ fn run_codex_screening_pipeline(
     artifacts: &CodexInventoryPlanArtifacts,
     run_dir: &Path,
     inventory_schema: &str,
+    interaction_schema: &str,
     reachability_schema: &str,
     model: Option<&str>,
     effort: Option<crate::cli::ReasoningEffort>,
+    stop_after_stage: Option<PipelineStage>,
     verbose: bool,
 ) -> Result<CodexScreeningPipelineOutput> {
     let inventory = run_codex_inventory(
@@ -933,9 +1019,55 @@ fn run_codex_screening_pipeline(
     let inventory_dir = inventory_stage_dir(screen_dir);
     persist_screening_analysis(&inventory_dir, &inventory.analysis)?;
 
+    if matches!(stop_after_stage, Some(PipelineStage::Inventory)) {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: inventory.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+        });
+    }
+
     if inventory.hypotheses.is_empty() {
         return Ok(CodexScreeningPipelineOutput {
             screening: inventory.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+        });
+    }
+
+    update_candidate_progress(
+        run_dir,
+        candidate.candidate_index,
+        Some(ProgressStatus::InProgress),
+        Some("screen interaction"),
+        None,
+    )?;
+    let interaction_artifacts = prepare_codex_interaction_artifacts(
+        repo_root,
+        screen_dir,
+        candidate,
+        artifacts,
+        &inventory.hypotheses,
+    )?;
+    let interaction_results = run_codex_interaction(
+        provider,
+        repo_root,
+        &interaction_artifacts,
+        run_dir,
+        interaction_schema,
+        candidate.candidate_index,
+        model,
+        effort,
+        verbose,
+    )?;
+    let interaction_dir = interaction_stage_dir(screen_dir);
+    let interaction_screening =
+        merge_codex_interaction_results(artifacts.clusters.len(), &interaction_results);
+    persist_screening_analysis(&interaction_dir, &interaction_screening)?;
+
+    if matches!(stop_after_stage, Some(PipelineStage::Interaction)) {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: interaction_screening,
             hotspot_plan: artifacts.hotspot_plan.clone(),
             reachability_results: Vec::new(),
         });
@@ -953,7 +1085,7 @@ fn run_codex_screening_pipeline(
         screen_dir,
         candidate,
         artifacts,
-        &inventory.hypotheses,
+        &interaction_results,
     )?;
     let reachability_results = run_codex_reachability(
         provider,
@@ -966,10 +1098,8 @@ fn run_codex_screening_pipeline(
         effort,
         verbose,
     )?;
-    let screening = merge_codex_reachability_results(
-        artifacts.hotspot_plan.clusters.len(),
-        &reachability_results,
-    );
+    let screening =
+        merge_codex_reachability_results(artifacts.clusters.len(), &reachability_results);
     let reachability_dir = reachability_stage_dir(screen_dir);
     persist_screening_analysis(&reachability_dir, &screening)?;
 
@@ -999,16 +1129,16 @@ fn run_codex_inventory(
             candidate_index,
             Some(ProgressStatus::InProgress),
             Some(&format!(
-                "screen inventory cluster {:04}",
+                "screen inventory focus {:04}",
                 cluster_artifact.cluster.cluster_index
             )),
             None,
         )?;
         log_step(
             verbose,
-            "inventory-cluster",
+            "inventory-focus",
             format!(
-                "inventory cluster {:04} ({})",
+                "inventory focus {:04} ({})",
                 cluster_artifact.cluster.cluster_index, cluster_artifact.cluster.title
             ),
         );
@@ -1028,7 +1158,7 @@ fn run_codex_inventory(
     }
 
     Ok(merge_codex_inventory_results(
-        artifacts.hotspot_plan.clusters.len(),
+        artifacts.clusters.len(),
         cluster_results,
     ))
 }
@@ -1043,11 +1173,21 @@ fn merge_codex_inventory_results(
     let mut positive_clusters = Vec::new();
 
     for (cluster, analysis) in cluster_results {
-        if !analysis.suspicious_findings.is_empty() {
+        let primary_finding = analysis
+            .suspicious_findings
+            .into_iter()
+            .max_by(|left, right| {
+                left.confidence
+                    .partial_cmp(&right.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.title.cmp(&right.title))
+            });
+
+        if primary_finding.is_some() {
             positive_clusters.push(cluster.title.clone());
         }
 
-        for finding in analysis.suspicious_findings {
+        if let Some(finding) = primary_finding {
             let key = format!(
                 "{}|{}|{}",
                 finding.commit_id.to_ascii_lowercase(),
@@ -1081,12 +1221,12 @@ fn merge_codex_inventory_results(
 
     let candidate_summary = if positive_clusters.is_empty() {
         format!(
-            "Inventoried {} hotspot cluster(s). No cluster produced a stable security hypothesis from the supplied evidence.",
+            "Inventoried {} hotspot focus unit(s). No focus produced a stable security hypothesis from the supplied evidence.",
             cluster_count
         )
     } else {
         format!(
-            "Inventoried {} hotspot cluster(s). Plausible security hypotheses came from: {}.",
+            "Inventoried {} hotspot focus unit(s). Plausible security hypotheses came from: {}.",
             cluster_count,
             positive_clusters.join("; ")
         )
@@ -1104,25 +1244,173 @@ fn merge_codex_inventory_results(
     }
 }
 
+/// Prepares one interaction-review bundle for each inventoried hypothesis.
+fn prepare_codex_interaction_artifacts(
+    repo_root: &Path,
+    screen_dir: &Path,
+    candidate: &CommitCandidate,
+    artifacts: &CodexInventoryPlanArtifacts,
+    hypotheses: &[CodexInventoryHypothesis],
+) -> Result<Vec<CodexInteractionArtifacts>> {
+    let interaction_dir = interaction_stage_dir(screen_dir);
+    fs::create_dir_all(&interaction_dir)
+        .with_context(|| format!("failed to create {}", interaction_dir.display()))?;
+
+    let mut outputs = Vec::with_capacity(hypotheses.len());
+    for hypothesis in hypotheses {
+        let hypothesis_dir =
+            interaction_dir.join(format!("hypothesis-{:04}", hypothesis.hypothesis_index));
+        fs::create_dir_all(&hypothesis_dir)
+            .with_context(|| format!("failed to create {}", hypothesis_dir.display()))?;
+        let selected_files = selected_files_for_hypothesis(hypothesis);
+        let filtered_patch = filtered_patch_for_selection(&artifacts.full_patch, &selected_files);
+        let evidence = persist_codex_evidence_bundle(
+            &hypothesis_dir,
+            repo_root,
+            candidate,
+            &selected_files,
+            &filtered_patch,
+            &artifacts.hotspot_plan,
+        )?;
+        let prompt_input = CodexInteractionPromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            cluster: hypothesis.cluster.clone(),
+            inventory_hypothesis: hypothesis.finding.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&hypothesis_dir.join("prompt-input.json"))?;
+        let prompt = prompt::render_codex_interaction_prompt(Path::new(&prompt_input_path));
+        persist_pass_artifacts(&hypothesis_dir, &prompt_input, &prompt)?;
+        outputs.push(CodexInteractionArtifacts {
+            hypothesis_index: hypothesis.hypothesis_index,
+            cluster: hypothesis.cluster.clone(),
+            inventory_finding: hypothesis.finding.clone(),
+            pass_dir: hypothesis_dir,
+            prompt,
+        });
+    }
+
+    Ok(outputs)
+}
+
+/// Runs one interaction review for each inventoried hypothesis.
+fn run_codex_interaction(
+    provider: &dyn crate::provider::AgentProvider,
+    working_dir: &Path,
+    artifacts: &[CodexInteractionArtifacts],
+    run_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<Vec<CodexInteractionRecord>> {
+    let mut results = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        update_candidate_progress(
+            run_dir,
+            candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some(&format!(
+                "screen interaction hypothesis {:04}",
+                artifact.hypothesis_index
+            )),
+            None,
+        )?;
+        log_step(
+            verbose,
+            "interaction",
+            format!(
+                "reviewing interaction for hypothesis {:04} from cluster {}",
+                artifact.hypothesis_index, artifact.cluster.title
+            ),
+        );
+        let analysis = provider.review_interaction(ProviderRequest {
+            working_dir,
+            prompt: &artifact.prompt,
+            schema,
+            pass_dir: &artifact.pass_dir,
+            candidate_index,
+            phase: AnalysisPhase::Screen,
+            model,
+            effort,
+            verbose,
+        })?;
+        persist_interaction_analysis(&artifact.pass_dir, &analysis)?;
+        results.push(CodexInteractionRecord {
+            hypothesis_index: artifact.hypothesis_index,
+            cluster: artifact.cluster.clone(),
+            inventory_finding: artifact.inventory_finding.clone(),
+            analysis,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Merges interaction-reviewed hypotheses into a stage summary.
+fn merge_codex_interaction_results(
+    cluster_count: usize,
+    interaction_results: &[CodexInteractionRecord],
+) -> ScreeningAnalysis {
+    let mut findings = Vec::new();
+    let mut kept = Vec::new();
+
+    for result in interaction_results {
+        if result.analysis.preserve_for_reachability || result.analysis.preserve_for_adjudication {
+            kept.push(format!(
+                "{} [{}]",
+                result.cluster.title,
+                interaction_kind_label(result.analysis.interaction_kind)
+            ));
+        }
+        if let Some(finding) = &result.analysis.refined_finding {
+            findings.push(finding.clone());
+        }
+    }
+
+    let candidate_summary = if kept.is_empty() {
+        format!(
+            "Reviewed {} hotspot cluster(s) for interaction-dependent security theories. No hypothesis needed special preservation beyond ordinary reachability.",
+            cluster_count
+        )
+    } else {
+        format!(
+            "Reviewed {} hotspot cluster(s) for interaction-dependent security theories. Preserved hypotheses came from: {}.",
+            cluster_count,
+            kept.join("; ")
+        )
+    };
+
+    ScreeningAnalysis {
+        candidate_summary,
+        suspicious_findings: findings,
+    }
+}
+
 /// Prepares one reachability bundle for each inventoried hypothesis.
 fn prepare_codex_reachability_artifacts(
     repo_root: &Path,
     screen_dir: &Path,
     candidate: &CommitCandidate,
     artifacts: &CodexInventoryPlanArtifacts,
-    hypotheses: &[CodexInventoryHypothesis],
+    interaction_results: &[CodexInteractionRecord],
 ) -> Result<Vec<CodexReachabilityArtifacts>> {
     let reachability_dir = reachability_stage_dir(screen_dir);
     fs::create_dir_all(&reachability_dir)
         .with_context(|| format!("failed to create {}", reachability_dir.display()))?;
 
-    let mut outputs = Vec::with_capacity(hypotheses.len());
-    for hypothesis in hypotheses {
+    let mut outputs = Vec::with_capacity(interaction_results.len());
+    for hypothesis in interaction_results {
+        if !should_review_reachability(&hypothesis.analysis) {
+            continue;
+        }
         let hypothesis_dir =
             reachability_dir.join(format!("hypothesis-{:04}", hypothesis.hypothesis_index));
         fs::create_dir_all(&hypothesis_dir)
             .with_context(|| format!("failed to create {}", hypothesis_dir.display()))?;
-        let selected_files = selected_files_for_hypothesis(hypothesis);
+        let selected_files = selected_files_for_interaction_record(hypothesis);
         let filtered_patch = filtered_patch_for_selection(&artifacts.full_patch, &selected_files);
         let evidence = persist_codex_evidence_bundle(
             &hypothesis_dir,
@@ -1137,7 +1425,8 @@ fn prepare_codex_reachability_artifacts(
             commit: build_codex_prompt_commit(candidate, evidence),
             hotspot_plan: artifacts.hotspot_plan.clone(),
             cluster: hypothesis.cluster.clone(),
-            inventory_hypothesis: hypothesis.finding.clone(),
+            inventory_hypothesis: hypothesis.inventory_finding.clone(),
+            interaction_review: hypothesis.analysis.clone(),
         };
         let prompt_input_path = absolute_artifact_path(&hypothesis_dir.join("prompt-input.json"))?;
         let prompt = prompt::render_codex_reachability_prompt(Path::new(&prompt_input_path));
@@ -1145,6 +1434,7 @@ fn prepare_codex_reachability_artifacts(
         outputs.push(CodexReachabilityArtifacts {
             hypothesis_index: hypothesis.hypothesis_index,
             cluster: hypothesis.cluster.clone(),
+            interaction_review: hypothesis.analysis.clone(),
             pass_dir: hypothesis_dir,
             prompt,
         });
@@ -1200,6 +1490,7 @@ fn run_codex_reachability(
         results.push(CodexReachabilityRecord {
             hypothesis_index: artifact.hypothesis_index,
             cluster: artifact.cluster.clone(),
+            interaction_analysis: artifact.interaction_review.clone(),
             analysis,
         });
     }
@@ -1216,35 +1507,46 @@ fn merge_codex_reachability_results(
     let mut surfaces = Vec::new();
 
     for result in reachability_results {
-        if result.analysis.verdict == ReachabilityVerdict::Rejected {
+        if !should_keep_reachability_result(result) {
             continue;
         }
 
         if let Some(finding) = &result.analysis.refined_finding {
             supported.push((
+                result.cluster.category.clone(),
+                result.interaction_analysis.verdict,
                 result.analysis.verdict,
+                result.analysis.assessment,
                 result.analysis.surface,
                 finding.clone(),
             ));
             surfaces.push(format!(
-                "{} [{}]",
+                "{} [{}/{}]",
                 result.cluster.title,
-                result.analysis.surface.as_str()
+                result.analysis.surface.as_str(),
+                result.analysis.assessment.as_str()
             ));
         }
     }
 
     supported.sort_by(|left, right| {
-        reachability_verdict_priority(right.0)
-            .cmp(&reachability_verdict_priority(left.0))
+        interaction_verdict_priority(right.1)
+            .cmp(&interaction_verdict_priority(left.1))
             .then_with(|| {
-                reachability_surface_priority(right.1).cmp(&reachability_surface_priority(left.1))
+                reachability_verdict_priority(right.2).cmp(&reachability_verdict_priority(left.2))
+            })
+            .then_with(|| {
+                reachability_assessment_priority(right.3)
+                    .cmp(&reachability_assessment_priority(left.3))
+            })
+            .then_with(|| {
+                reachability_surface_priority(right.4).cmp(&reachability_surface_priority(left.4))
             })
             .then_with(|| {
                 right
-                    .2
+                    .5
                     .confidence
-                    .partial_cmp(&left.2.confidence)
+                    .partial_cmp(&left.5.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
@@ -1266,9 +1568,21 @@ fn merge_codex_reachability_results(
         candidate_summary,
         suspicious_findings: supported
             .into_iter()
-            .map(|(_, _, finding)| finding)
+            .map(|(_, _, _, _, _, finding)| finding)
             .collect(),
     }
+}
+
+/// Returns whether an interaction-reviewed hypothesis should continue into reachability review.
+fn should_review_reachability(analysis: &InteractionAnalysis) -> bool {
+    analysis.preserve_for_reachability || analysis.preserve_for_adjudication
+}
+
+/// Returns whether a reachability-reviewed hypothesis should remain visible after filtering.
+fn should_keep_reachability_result(result: &CodexReachabilityRecord) -> bool {
+    result.analysis.verdict != ReachabilityVerdict::Rejected
+        || result.analysis.keep_for_adjudication
+        || result.interaction_analysis.preserve_for_adjudication
 }
 
 /// Selects the files and snapshots needed to review one inventoried hypothesis.
@@ -1279,6 +1593,23 @@ fn selected_files_for_hypothesis(hypothesis: &CodexInventoryHypothesis) -> Vec<S
     }
     for path in &hypothesis.finding.affected_files {
         selected.insert(path.clone());
+    }
+    selected.into_iter().collect()
+}
+
+/// Selects the files and snapshots needed to review one interaction-reviewed hypothesis.
+fn selected_files_for_interaction_record(hypothesis: &CodexInteractionRecord) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in &hypothesis.cluster.files {
+        selected.insert(path.clone());
+    }
+    for path in &hypothesis.inventory_finding.affected_files {
+        selected.insert(path.clone());
+    }
+    if let Some(finding) = &hypothesis.analysis.refined_finding {
+        for path in &finding.affected_files {
+            selected.insert(path.clone());
+        }
     }
     selected.into_iter().collect()
 }
@@ -1307,10 +1638,97 @@ fn reachability_surface_priority(surface: ReachabilitySurface) -> usize {
     match surface {
         ReachabilitySurface::Remote => 5,
         ReachabilitySurface::Adjacent => 4,
-        ReachabilitySurface::LocalApi => 3,
-        ReachabilitySurface::Unknown => 2,
+        ReachabilitySurface::Unknown => 3,
+        ReachabilitySurface::LocalApi => 2,
         ReachabilitySurface::InternalOnly => 1,
     }
+}
+
+/// Returns the ranking priority for one interaction verdict.
+fn interaction_verdict_priority(verdict: InteractionVerdict) -> usize {
+    match verdict {
+        InteractionVerdict::Strong => 3,
+        InteractionVerdict::Plausible => 2,
+        InteractionVerdict::Absent => 1,
+    }
+}
+
+/// Returns the ranking priority for one reachability assessment.
+fn reachability_assessment_priority(assessment: ReachabilityAssessment) -> usize {
+    match assessment {
+        ReachabilityAssessment::DirectReachability => 4,
+        ReachabilityAssessment::InteractionDependent => 3,
+        ReachabilityAssessment::LocalApiOnly => 2,
+        ReachabilityAssessment::Rejected => 1,
+    }
+}
+
+/// Returns a short label for one interaction kind.
+fn interaction_kind_label(kind: InteractionKind) -> &'static str {
+    match kind {
+        InteractionKind::FeatureInteraction => "feature_interaction",
+        InteractionKind::SharedVerificationFlow => "shared_verification_flow",
+        InteractionKind::DirectPath => "direct_path",
+        InteractionKind::None => "none",
+    }
+}
+
+/// Returns whether a finalist represents an interaction-heavy security theory.
+fn is_interaction_priority_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
+    finalist.reachability_assessment == ReachabilityAssessment::InteractionDependent
+        || finalist.interaction_verdict != InteractionVerdict::Absent
+            && finalist.interaction_kind != InteractionKind::None
+}
+
+/// Returns whether a finalist keeps a non-local attacker surface.
+fn is_network_priority_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
+    matches!(
+        finalist.surface,
+        ReachabilitySurface::Remote | ReachabilitySurface::Adjacent
+    )
+}
+
+/// Returns whether a finalist primarily describes local API misuse or contract hardening.
+fn is_local_api_only_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
+    finalist.reachability_assessment == ReachabilityAssessment::LocalApiOnly
+        || finalist.surface == ReachabilitySurface::LocalApi
+}
+
+/// Returns the coarse adjudication priority bucket for one finalist.
+fn adjudication_track_priority(finalist: &CodexAdjudicationCandidate) -> usize {
+    if is_network_priority_finalist(finalist) {
+        4
+    } else if is_interaction_priority_finalist(finalist) {
+        3
+    } else if finalist.surface == ReachabilitySurface::Unknown {
+        2
+    } else if is_local_api_only_finalist(finalist) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Appends one finalist when it fits the current adjudication byte budget.
+fn try_select_finalist(
+    selected: &mut Vec<CodexAdjudicationCandidate>,
+    selected_indexes: &mut BTreeSet<usize>,
+    total_bytes: &mut usize,
+    finalist: &CodexAdjudicationCandidate,
+) -> Result<bool> {
+    if selected_indexes.contains(&finalist.hypothesis_index) {
+        return Ok(false);
+    }
+
+    let bytes = serde_json::to_vec(finalist)?.len();
+    if !selected.is_empty() && *total_bytes + bytes > MAX_ADJUDICATION_INPUT_BYTES {
+        return Ok(false);
+    }
+
+    *total_bytes += bytes;
+    selected_indexes.insert(finalist.hypothesis_index);
+    selected.push(finalist.clone());
+    Ok(true)
 }
 
 /// Shortlists adjudication finalists under a serialized byte budget.
@@ -1321,25 +1739,49 @@ fn select_adjudication_finalists(
         .iter()
         .filter_map(|result| {
             let refined_finding = result.analysis.refined_finding.clone()?;
-            if result.analysis.verdict == ReachabilityVerdict::Rejected {
+            if !should_keep_reachability_result(result) {
                 return None;
             }
 
             Some(CodexAdjudicationCandidate {
                 hypothesis_index: result.hypothesis_index,
                 cluster_title: result.cluster.title.clone(),
+                cluster_category: result.cluster.category.clone(),
+                interaction_summary: result.interaction_analysis.hypothesis_summary.clone(),
+                interaction_verdict: result.interaction_analysis.verdict,
+                interaction_kind: result.interaction_analysis.interaction_kind,
                 reachability_summary: result.analysis.hypothesis_summary.clone(),
                 reachability_verdict: result.analysis.verdict,
+                reachability_assessment: result.analysis.assessment,
                 surface: result.analysis.surface,
-                preconditions: result.analysis.preconditions.clone(),
+                preconditions: result
+                    .interaction_analysis
+                    .preconditions
+                    .iter()
+                    .cloned()
+                    .chain(result.analysis.preconditions.iter().cloned())
+                    .collect(),
                 refined_finding,
             })
         })
         .collect::<Vec<_>>();
 
     finalists.sort_by(|left, right| {
-        reachability_verdict_priority(right.reachability_verdict)
-            .cmp(&reachability_verdict_priority(left.reachability_verdict))
+        adjudication_track_priority(right)
+            .cmp(&adjudication_track_priority(left))
+            .then_with(|| {
+                interaction_verdict_priority(right.interaction_verdict)
+                    .cmp(&interaction_verdict_priority(left.interaction_verdict))
+            })
+            .then_with(|| {
+                reachability_assessment_priority(right.reachability_assessment).cmp(
+                    &reachability_assessment_priority(left.reachability_assessment),
+                )
+            })
+            .then_with(|| {
+                reachability_verdict_priority(right.reachability_verdict)
+                    .cmp(&reachability_verdict_priority(left.reachability_verdict))
+            })
             .then_with(|| {
                 reachability_surface_priority(right.surface)
                     .cmp(&reachability_surface_priority(left.surface))
@@ -1354,14 +1796,53 @@ fn select_adjudication_finalists(
     });
 
     let mut selected = Vec::new();
+    let mut selected_indexes = BTreeSet::new();
     let mut total_bytes = 0usize;
+
+    for predicate in [
+        is_interaction_priority_finalist as fn(&CodexAdjudicationCandidate) -> bool,
+        is_network_priority_finalist,
+        |finalist: &CodexAdjudicationCandidate| !is_local_api_only_finalist(finalist),
+    ] {
+        if let Some(finalist) = finalists.iter().find(|candidate| predicate(candidate)) {
+            try_select_finalist(
+                &mut selected,
+                &mut selected_indexes,
+                &mut total_bytes,
+                finalist,
+            )?;
+        }
+    }
+
+    let mut category_best = Vec::<CodexAdjudicationCandidate>::new();
+    for finalist in finalists.iter().cloned() {
+        if category_best
+            .iter()
+            .any(|existing| existing.cluster_category == finalist.cluster_category)
+        {
+            continue;
+        }
+        category_best.push(finalist);
+    }
+    for finalist in &category_best {
+        try_select_finalist(
+            &mut selected,
+            &mut selected_indexes,
+            &mut total_bytes,
+            finalist,
+        )?;
+    }
+
     for finalist in finalists {
-        let bytes = serde_json::to_vec(&finalist)?.len();
-        if !selected.is_empty() && total_bytes + bytes > MAX_ADJUDICATION_INPUT_BYTES {
+        if !try_select_finalist(
+            &mut selected,
+            &mut selected_indexes,
+            &mut total_bytes,
+            &finalist,
+        )? && total_bytes >= MAX_ADJUDICATION_INPUT_BYTES
+        {
             break;
         }
-        total_bytes += bytes;
-        selected.push(finalist);
     }
 
     Ok(selected)
@@ -2024,14 +2505,18 @@ impl ProgressUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        absolute_artifact_path, bundle_snapshot_path, ensure_manifest, initialize_progress_state,
-        load_progress_state, load_saved_candidate_outcome, persist_candidate_outcome,
-        validate_args,
+        CodexReachabilityRecord, absolute_artifact_path, bundle_snapshot_path, ensure_manifest,
+        initialize_progress_state, load_progress_state, load_saved_candidate_outcome,
+        merge_codex_inventory_results, persist_candidate_outcome, select_adjudication_finalists,
+        should_keep_reachability_result, should_review_reachability, validate_args,
     };
-    use crate::cli::{AnalyzeArgs, ProviderKind};
+    use crate::cli::{AnalyzeArgs, PipelineStage, ProviderKind};
+    use crate::hotspot::HotspotCluster;
     use crate::types::{
-        CandidateOutcome, CommitCandidate, CommitRecord, ProgressResult, ProgressStatus,
-        RunManifest, ScreeningAnalysis,
+        CandidateOutcome, CommitCandidate, CommitRecord, InteractionAnalysis, InteractionKind,
+        InteractionVerdict, ProgressResult, ProgressStatus, ReachabilityAnalysis,
+        ReachabilityAssessment, ReachabilitySurface, ReachabilityVerdict, RunManifest,
+        ScreeningAnalysis, SuspiciousFinding,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2054,7 +2539,31 @@ mod tests {
             out: PathBuf::from("out"),
             verbose: false,
             dry_run: true,
+            stop_after_stage: None,
         };
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn rejects_stop_after_stage_for_claude() {
+        let args = AnalyzeArgs {
+            repo: PathBuf::from("."),
+            from: "a".into(),
+            to: "b".into(),
+            provider: ProviderKind::Claude,
+            model: None,
+            effort: None,
+            screen_effort: None,
+            verify_effort: None,
+            max_commits: None,
+            max_patch_bytes: 100,
+            min_confidence: 0.5,
+            out: PathBuf::from("out"),
+            verbose: false,
+            dry_run: true,
+            stop_after_stage: Some(PipelineStage::Inventory),
+        };
+
         assert!(validate_args(&args).is_err());
     }
 
@@ -2184,6 +2693,157 @@ mod tests {
         assert!(resolved.ends_with(".tmp/tests/nonexistent/prompt-input.json"));
     }
 
+    #[test]
+    fn interaction_preserve_for_adjudication_still_enters_reachability() {
+        let analysis = InteractionAnalysis {
+            hypothesis_summary: "interaction".into(),
+            verdict: InteractionVerdict::Plausible,
+            interaction_kind: InteractionKind::FeatureInteraction,
+            preconditions: vec!["mixed algorithm support".into()],
+            preserve_for_reachability: false,
+            preserve_for_adjudication: true,
+            refined_finding: None,
+        };
+
+        assert!(should_review_reachability(&analysis));
+    }
+
+    #[test]
+    fn rejected_reachability_can_survive_when_interaction_preserves_adjudication() {
+        let record = sample_reachability_record(
+            7,
+            "digest_length_verify",
+            InteractionAnalysis {
+                hypothesis_summary: "shared verification flow".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::SharedVerificationFlow,
+                preconditions: vec!["certificate verification path".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "shared verification flow",
+                    0.72,
+                    "wolfcrypt/src/asn.c",
+                )),
+            },
+            ReachabilityAnalysis {
+                hypothesis_summary: "direct path remains weak".into(),
+                verdict: ReachabilityVerdict::Rejected,
+                surface: ReachabilitySurface::Unknown,
+                assessment: ReachabilityAssessment::InteractionDependent,
+                preconditions: vec!["mixed feature support".into()],
+                keep_for_adjudication: false,
+                refined_finding: Some(sample_finding(
+                    "shared verification flow",
+                    0.72,
+                    "wolfcrypt/src/asn.c",
+                )),
+            },
+        );
+
+        assert!(should_keep_reachability_result(&record));
+    }
+
+    #[test]
+    fn adjudication_finalists_prioritize_interaction_theories_over_local_api_only() {
+        let local_api = sample_reachability_record(
+            1,
+            "digest_length_sign",
+            InteractionAnalysis {
+                hypothesis_summary: "plain local api".into(),
+                verdict: InteractionVerdict::Absent,
+                interaction_kind: InteractionKind::DirectPath,
+                preconditions: vec![],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: false,
+                refined_finding: Some(sample_finding(
+                    "local api overflow",
+                    0.96,
+                    "wolfcrypt/src/dilithium.c",
+                )),
+            },
+            ReachabilityAnalysis {
+                hypothesis_summary: "public hash api overflow".into(),
+                verdict: ReachabilityVerdict::Supported,
+                surface: ReachabilitySurface::LocalApi,
+                assessment: ReachabilityAssessment::LocalApiOnly,
+                preconditions: vec!["application exposes hash api".into()],
+                keep_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "local api overflow",
+                    0.96,
+                    "wolfcrypt/src/dilithium.c",
+                )),
+            },
+        );
+        let interaction = sample_reachability_record(
+            2,
+            "digest_length_verify",
+            InteractionAnalysis {
+                hypothesis_summary: "mixed-family verification path".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::FeatureInteraction,
+                preconditions: vec!["eddsa or ml-dsa enabled".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "ecdsa verification accepted undersized digest",
+                    0.78,
+                    "src/pk_ec.c",
+                )),
+            },
+            ReachabilityAnalysis {
+                hypothesis_summary: "shared verification path not fully proven locally".into(),
+                verdict: ReachabilityVerdict::Weak,
+                surface: ReachabilitySurface::Unknown,
+                assessment: ReachabilityAssessment::InteractionDependent,
+                preconditions: vec!["certificate verification flow".into()],
+                keep_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "ecdsa verification accepted undersized digest",
+                    0.78,
+                    "src/pk_ec.c",
+                )),
+            },
+        );
+
+        let finalists = select_adjudication_finalists(&[local_api, interaction])
+            .expect("selection should work");
+
+        assert_eq!(finalists[0].hypothesis_index, 2);
+        assert!(
+            finalists
+                .iter()
+                .any(|finalist| finalist.hypothesis_index == 1)
+        );
+        assert!(
+            finalists
+                .iter()
+                .any(|finalist| finalist.hypothesis_index == 2)
+        );
+    }
+
+    #[test]
+    fn inventory_merge_keeps_only_primary_finding_per_focus() {
+        let cluster = sample_cluster("digest_length_verify");
+        let merged = merge_codex_inventory_results(
+            1,
+            vec![(
+                cluster,
+                ScreeningAnalysis {
+                    candidate_summary: "summary".into(),
+                    suspicious_findings: vec![
+                        sample_finding("lower confidence", 0.61, "src/a.rs"),
+                        sample_finding("higher confidence", 0.88, "src/a.rs"),
+                    ],
+                },
+            )],
+        );
+
+        assert_eq!(merged.hypotheses.len(), 1);
+        assert_eq!(merged.hypotheses[0].finding.title, "higher confidence");
+    }
+
     fn sample_manifest(provider: &str) -> RunManifest {
         RunManifest {
             provider: provider.to_owned(),
@@ -2196,6 +2856,7 @@ mod tests {
             commit_count: 1,
             max_patch_bytes: 100,
             dry_run: false,
+            stop_after_stage: None,
         }
     }
 
@@ -2222,6 +2883,46 @@ mod tests {
             file_stats: Vec::new(),
             patch: "patch".into(),
             patch_truncated: false,
+        }
+    }
+
+    fn sample_finding(title: &str, confidence: f32, path: &str) -> SuspiciousFinding {
+        SuspiciousFinding {
+            title: title.into(),
+            confidence,
+            commit_id: "commit".into(),
+            rationale: "rationale".into(),
+            likely_bug_class: Some("bug_class".into()),
+            affected_files: vec![path.into()],
+            evidence: vec!["evidence".into()],
+            follow_up: vec!["follow_up".into()],
+        }
+    }
+
+    fn sample_cluster(category: &str) -> HotspotCluster {
+        HotspotCluster {
+            cluster_index: 0,
+            title: format!("{category} cluster"),
+            rationale: "rationale".into(),
+            category: category.into(),
+            files: vec!["src/a.rs".into()],
+            function_hints: vec!["function".into()],
+            signal_terms: vec!["signal".into()],
+            score: 10,
+        }
+    }
+
+    fn sample_reachability_record(
+        hypothesis_index: usize,
+        cluster_category: &str,
+        interaction_analysis: InteractionAnalysis,
+        analysis: ReachabilityAnalysis,
+    ) -> CodexReachabilityRecord {
+        CodexReachabilityRecord {
+            hypothesis_index,
+            cluster: sample_cluster(cluster_category),
+            interaction_analysis,
+            analysis,
         }
     }
 }

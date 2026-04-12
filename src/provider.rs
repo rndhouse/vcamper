@@ -12,7 +12,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::cli::{ProviderKind, ReasoningEffort};
-use crate::types::{ReachabilityAnalysis, ScreeningAnalysis, VerificationAnalysis};
+use crate::types::{
+    InteractionAnalysis, ReachabilityAnalysis, ScreeningAnalysis, VerificationAnalysis,
+};
 
 /// Provider invocation request for one commit candidate.
 pub(crate) struct ProviderRequest<'a> {
@@ -59,6 +61,9 @@ impl AnalysisPhase {
 pub(crate) trait AgentProvider {
     /// Runs the first-pass screener for one commit candidate.
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis>;
+
+    /// Runs one interaction review for a screened hypothesis.
+    fn review_interaction(&self, request: ProviderRequest<'_>) -> Result<InteractionAnalysis>;
 
     /// Runs one reachability review for a screened hypothesis.
     fn review_reachability(&self, request: ProviderRequest<'_>) -> Result<ReachabilityAnalysis>;
@@ -175,6 +180,73 @@ pub(crate) fn verification_schema() -> Result<String> {
     }))?)
 }
 
+/// Returns the structured output schema required from interaction-review passes.
+pub(crate) fn interaction_schema() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "hypothesis_summary": { "type": "string" },
+            "verdict": {
+                "type": "string",
+                "enum": ["strong", "plausible", "absent"]
+            },
+            "interaction_kind": {
+                "type": "string",
+                "enum": ["feature_interaction", "shared_verification_flow", "direct_path", "none"]
+            },
+            "preconditions": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "preserve_for_reachability": { "type": "boolean" },
+            "preserve_for_adjudication": { "type": "boolean" },
+            "refined_finding": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "properties": {
+                    "title": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "commit_id": { "type": "string" },
+                    "rationale": { "type": "string" },
+                    "likely_bug_class": { "type": ["string", "null"] },
+                    "affected_files": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "follow_up": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": [
+                    "title",
+                    "confidence",
+                    "commit_id",
+                    "rationale",
+                    "likely_bug_class",
+                    "affected_files",
+                    "evidence",
+                    "follow_up"
+                ]
+            }
+        },
+        "required": [
+            "hypothesis_summary",
+            "verdict",
+            "interaction_kind",
+            "preconditions",
+            "preserve_for_reachability",
+            "preserve_for_adjudication",
+            "refined_finding"
+        ]
+    }))?)
+}
+
 /// Returns the structured output schema required from reachability-review passes.
 pub(crate) fn reachability_schema() -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
@@ -190,10 +262,15 @@ pub(crate) fn reachability_schema() -> Result<String> {
                 "type": "string",
                 "enum": ["remote", "adjacent", "local_api", "internal_only", "unknown"]
             },
+            "assessment": {
+                "type": "string",
+                "enum": ["direct_reachability", "interaction_dependent", "local_api_only", "rejected"]
+            },
             "preconditions": {
                 "type": "array",
                 "items": { "type": "string" }
             },
+            "keep_for_adjudication": { "type": "boolean" },
             "refined_finding": {
                 "type": ["object", "null"],
                 "additionalProperties": false,
@@ -232,7 +309,9 @@ pub(crate) fn reachability_schema() -> Result<String> {
             "hypothesis_summary",
             "verdict",
             "surface",
+            "assessment",
             "preconditions",
+            "keep_for_adjudication",
             "refined_finding"
         ]
     }))?)
@@ -243,6 +322,10 @@ struct CodexProvider;
 
 impl AgentProvider for CodexProvider {
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis> {
+        run_codex_structured(request)
+    }
+
+    fn review_interaction(&self, request: ProviderRequest<'_>) -> Result<InteractionAnalysis> {
         run_codex_structured(request)
     }
 
@@ -260,6 +343,10 @@ struct ClaudeProvider;
 
 impl AgentProvider for ClaudeProvider {
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis> {
+        run_claude_structured(request)
+    }
+
+    fn review_interaction(&self, request: ProviderRequest<'_>) -> Result<InteractionAnalysis> {
         run_claude_structured(request)
     }
 

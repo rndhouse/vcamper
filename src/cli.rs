@@ -81,6 +81,10 @@ pub(crate) struct AnalyzeArgs {
     /// Render prompts and Git evidence without invoking an agent CLI.
     #[arg(long, default_value_t = false)]
     pub(crate) dry_run: bool,
+
+    /// Stop after the selected staged analysis step instead of running the full pipeline.
+    #[arg(long, value_enum)]
+    pub(crate) stop_after_stage: Option<PipelineStage>,
 }
 
 /// Agent providers supported by the CLI proof of concept.
@@ -109,6 +113,27 @@ pub(crate) enum ReasoningEffort {
     Xhigh,
 }
 
+/// Staged analysis boundary used for partial Codex runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PipelineStage {
+    Inventory,
+    Interaction,
+    Reachability,
+    Verify,
+}
+
+impl PipelineStage {
+    /// Returns the lowercase stage label used in manifests and logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Interaction => "interaction",
+            Self::Reachability => "reachability",
+            Self::Verify => "verify",
+        }
+    }
+}
+
 impl ReasoningEffort {
     /// Returns the provider-specific lowercase effort string.
     pub(crate) fn as_str(self) -> &'static str {
@@ -135,7 +160,7 @@ impl AnalyzeArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, PipelineStage};
     use clap::Parser;
 
     #[test]
@@ -158,5 +183,29 @@ mod tests {
         let Commands::Analyze(args) = cli.command;
         assert_eq!(args.max_patch_bytes, 40_000);
         assert_eq!(args.min_confidence, 0.65);
+        assert_eq!(args.stop_after_stage, None);
+    }
+
+    #[test]
+    fn analyze_parses_stop_after_stage() {
+        let cli = Cli::parse_from([
+            "vcamper",
+            "analyze",
+            "--repo",
+            ".",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--provider",
+            "codex",
+            "--out",
+            "out",
+            "--stop-after-stage",
+            "inventory",
+        ]);
+
+        let Commands::Analyze(args) = cli.command;
+        assert_eq!(args.stop_after_stage, Some(PipelineStage::Inventory));
     }
 }

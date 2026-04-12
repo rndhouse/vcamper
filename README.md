@@ -54,6 +54,7 @@ Useful flags:
 - `--max-commits <n>`: fail fast when the range is larger than expected
 - `--max-patch-bytes <n>`: cap the diff bytes stored in truncated commit artifacts and inline fallback prompts
 - `--out <dir>`: write artifacts to a specific run directory
+- `--stop-after-stage <inventory|interaction|reachability|verify>`: stop after a staged Codex boundary so you can inspect one stage in isolation
 - `--verbose`: print detailed internal logs and streamed provider output
 
 Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there.
@@ -62,19 +63,21 @@ By default, VCamper suppresses provider event output in the terminal. The defaul
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
-For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as three staged invocations inside each candidate:
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as four staged invocations inside each candidate:
 
-- inventory: derive a ranked hotspot plan from the full patch and inventory distinct hypotheses per hotspot cluster
-- reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface
+- inventory: derive a ranked hotspot plan from the full patch and run one narrow focus prompt per hotspot file so the first-stage theories do not compete inside one broad prompt
+- interaction review: inspect each hypothesis for mixed-feature, shared-flow, or compile-time interaction signals that ordinary reachability review could miss
+- reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface without prematurely discarding interaction-dependent theories
 - adjudication: compare only the shortlisted reachability survivors and pick the strongest supported finding, or reject them all
 
-That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count.
+That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, interaction review, or reachability before continuing.
 
 VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, reachability, or adjudication.
 
 The analysis flow is still reported as `screen` then `verify`, but Codex internally expands that into:
 
-- `screen/inventory`: code-first clustered hypothesis inventory with commit messages withheld
+- `screen/inventory`: code-first focused hypothesis inventory with commit messages withheld
+- `screen/interaction`: one-hypothesis interaction review for shared verification flows, feature combinations, and compile-time branches
 - `screen/reachability`: one-hypothesis exploit-path review with compact bundles
 - `verify`: final adjudication over reachability-shortlisted finalists, with the commit message restored as secondary context
 
@@ -98,13 +101,17 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `candidate-*/screen/prompt.txt`: rendered screener prompt
 - `candidate-*/screen/evidence/patch.diff`: full untruncated patch for the screening pass
 - `candidate-*/screen/evidence/changed-files.txt`: changed file list for the screening pass
-- `candidate-*/screen/evidence/hotspots.json`: ranked hotspot files and screening clusters derived from the full patch
+- `candidate-*/screen/evidence/hotspots.json`: ranked hotspot files and screening focus units derived from the full patch
 - `candidate-*/screen/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
 - `candidate-*/screen/evidence/before/*` and `candidate-*/screen/evidence/after/*`: file snapshots available to Codex during screening
-- `candidate-*/screen/inventory/cluster-*/prompt-input.json` and `prompt.txt`: cluster-specific inventory evidence and prompt
-- `candidate-*/screen/inventory/cluster-*/evidence/*`: filtered patch, hotspot plan, and snapshots for one inventory cluster
-- `candidate-*/screen/inventory/cluster-*/analysis.json`: per-cluster inventory result before candidate-level merging
+- `candidate-*/screen/inventory/cluster-*/prompt-input.json` and `prompt.txt`: focus-specific inventory evidence and prompt
+- `candidate-*/screen/inventory/cluster-*/evidence/*`: filtered patch, hotspot plan, and snapshots for one inventory focus unit
+- `candidate-*/screen/inventory/cluster-*/analysis.json`: one primary inventory result for that focus unit
 - `candidate-*/screen/inventory/analysis.json`: merged inventory result before reachability filtering
+- `candidate-*/screen/interaction/hypothesis-*/prompt-input.json` and `prompt.txt`: one-hypothesis interaction-review evidence and prompt
+- `candidate-*/screen/interaction/hypothesis-*/evidence/*`: hypothesis-local patch subset, hotspot plan, and snapshots for interaction review
+- `candidate-*/screen/interaction/hypothesis-*/analysis.json`: one interaction-review verdict, preservation decision, and refined finding
+- `candidate-*/screen/interaction/analysis.json`: merged interaction-review summary before reachability
 - `candidate-*/screen/reachability/hypothesis-*/prompt-input.json` and `prompt.txt`: one-hypothesis reachability evidence and prompt
 - `candidate-*/screen/reachability/hypothesis-*/evidence/*`: hypothesis-local patch subset, hotspot plan, and snapshots
 - `candidate-*/screen/reachability/hypothesis-*/analysis.json`: one reachability verdict and refined finding

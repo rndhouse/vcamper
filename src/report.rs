@@ -203,8 +203,13 @@ where
 fn render_summary(report: &AnalysisReport) -> String {
     let mut output = String::new();
     output.push_str("# VCamper Analysis Summary\n\n");
+    let stop_after = report
+        .manifest
+        .stop_after_stage
+        .clone()
+        .unwrap_or_else(|| "full pipeline".to_owned());
     output.push_str(&format!(
-        "- Repo: `{}`\n- Range: `{}`..`{}`\n- Provider: `{}`\n- Model: `{}`\n- Screen effort: `{}`\n- Verify effort: `{}`\n- Commits analyzed: `{}`\n- Candidates: `{}`\n\n",
+        "- Repo: `{}`\n- Range: `{}`..`{}`\n- Provider: `{}`\n- Model: `{}`\n- Screen effort: `{}`\n- Verify effort: `{}`\n- Stop after stage: `{}`\n- Commits analyzed: `{}`\n- Candidates: `{}`\n\n",
         report.manifest.repo_root,
         report.manifest.from,
         report.manifest.to,
@@ -224,6 +229,7 @@ fn render_summary(report: &AnalysisReport) -> String {
             .verify_effort
             .clone()
             .unwrap_or_else(|| "provider default".to_owned()),
+        stop_after,
         report.manifest.commit_count,
         report.candidate_count
     ));
@@ -338,6 +344,7 @@ mod tests {
                 commit_count: 1,
                 max_patch_bytes: 100,
                 dry_run: false,
+                stop_after_stage: None,
             },
             &candidates,
             &outcomes,

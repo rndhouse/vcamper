@@ -70,6 +70,52 @@ pub(crate) struct VerificationAnalysis {
     pub(crate) confirmed_findings: Vec<SuspiciousFinding>,
 }
 
+/// Interaction review for one screened hypothesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InteractionAnalysis {
+    /// Short provider summary for the reviewed hypothesis.
+    pub(crate) hypothesis_summary: String,
+    /// Strength of the supported interaction or shared-flow claim.
+    pub(crate) verdict: InteractionVerdict,
+    /// Kind of interaction or shared flow the review found.
+    pub(crate) interaction_kind: InteractionKind,
+    /// Preconditions that must hold for the interaction hypothesis to matter.
+    pub(crate) preconditions: Vec<String>,
+    /// Whether the hypothesis should continue into reachability review.
+    pub(crate) preserve_for_reachability: bool,
+    /// Whether the hypothesis should remain eligible for final adjudication even when later
+    /// reachability is weak.
+    pub(crate) preserve_for_adjudication: bool,
+    /// Refined finding when the interaction review strengthens or narrows the hypothesis.
+    pub(crate) refined_finding: Option<SuspiciousFinding>,
+}
+
+/// Strength of the supported interaction or shared-flow claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InteractionVerdict {
+    /// The code directly supports a strong interaction-dependent security theory.
+    Strong,
+    /// The code supports a plausible interaction-dependent theory that needs later adjudication.
+    Plausible,
+    /// The review did not find a meaningful interaction-dependent theory.
+    Absent,
+}
+
+/// Kind of interaction or shared flow found during interaction review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InteractionKind {
+    /// The issue depends on compile-time or runtime interaction across signature families.
+    FeatureInteraction,
+    /// The issue depends on shared internal verification or parser flows.
+    SharedVerificationFlow,
+    /// The issue is primarily a direct API or parser path, not an interaction-specific theory.
+    DirectPath,
+    /// No meaningful interaction-specific pattern was found.
+    None,
+}
+
 /// Reachability review for one screened hypothesis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReachabilityAnalysis {
@@ -79,8 +125,12 @@ pub(crate) struct ReachabilityAnalysis {
     pub(crate) verdict: ReachabilityVerdict,
     /// Strongest supported attack surface for the hypothesis.
     pub(crate) surface: ReachabilitySurface,
+    /// Classification of why the hypothesis was kept, weakened, or rejected.
+    pub(crate) assessment: ReachabilityAssessment,
     /// Preconditions that must hold for the hypothesis to matter.
     pub(crate) preconditions: Vec<String>,
+    /// Whether the hypothesis should remain eligible for final adjudication.
+    pub(crate) keep_for_adjudication: bool,
     /// Refined finding when the hypothesis remains security-relevant.
     pub(crate) refined_finding: Option<SuspiciousFinding>,
 }
@@ -122,6 +172,33 @@ impl ReachabilitySurface {
             Self::LocalApi => "local_api",
             Self::InternalOnly => "internal_only",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classification of how reachability review evaluated the hypothesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReachabilityAssessment {
+    /// The hypothesis has a direct attack path in the supplied code.
+    DirectReachability,
+    /// The issue may depend on a shared verification flow or feature interaction not fully proven
+    /// by the local bundle.
+    InteractionDependent,
+    /// The hypothesis looks like public local API misuse or contract hardening.
+    LocalApiOnly,
+    /// The hypothesis does not survive the reachability review.
+    Rejected,
+}
+
+impl ReachabilityAssessment {
+    /// Returns the lowercase assessment label used in summaries.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectReachability => "direct_reachability",
+            Self::InteractionDependent => "interaction_dependent",
+            Self::LocalApiOnly => "local_api_only",
+            Self::Rejected => "rejected",
         }
     }
 }
@@ -220,6 +297,8 @@ pub(crate) struct RunManifest {
     pub(crate) max_patch_bytes: usize,
     /// Whether provider execution was skipped.
     pub(crate) dry_run: bool,
+    /// Optional staged stop boundary for partial runs.
+    pub(crate) stop_after_stage: Option<String>,
 }
 
 /// Persisted progress state for one analysis run.
