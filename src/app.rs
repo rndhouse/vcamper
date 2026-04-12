@@ -16,14 +16,18 @@ use crate::git;
 use crate::hotspot::{self, HotspotCluster, HotspotPlan};
 use crate::prompt;
 use crate::provider::{
-    AnalysisPhase, ProviderRequest, build_provider, screening_schema, verification_schema,
+    AnalysisPhase, ProviderRequest, build_provider, reachability_schema, screening_schema,
+    verification_schema,
 };
 use crate::report;
 use crate::types::{
     CandidateOutcome, CommitCandidate, FileStat, ProgressCompleteCandidate,
-    ProgressPendingCandidate, ProgressResult, ProgressState, ProgressStatus, RunManifest,
-    ScreeningAnalysis, VerificationAnalysis,
+    ProgressPendingCandidate, ProgressResult, ProgressState, ProgressStatus, ReachabilityAnalysis,
+    ReachabilitySurface, ReachabilityVerdict, RunManifest, ScreeningAnalysis, SuspiciousFinding,
+    VerificationAnalysis,
 };
+
+const MAX_ADJUDICATION_INPUT_BYTES: usize = 28_000;
 
 /// Runs the selected CLI command.
 pub(crate) fn run(cli: Cli) -> Result<()> {
@@ -124,6 +128,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     initialize_progress_state(&run_dir, &candidates)?;
 
     let screen_schema = screening_schema()?;
+    let reachability_review_schema = reachability_schema()?;
     let verify_schema = verification_schema()?;
     let provider = build_provider(args.provider);
     let progress = ProgressUi::new(candidates.len(), manifest.commit_count, verbose);
@@ -153,6 +158,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 update_candidate_progress(
                     &run_dir,
                     candidate.candidate_index,
+                    None,
                     None,
                     Some(progress_result_from_outcome(
                         &saved_outcome,
@@ -196,6 +202,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             &run_dir,
             candidate.candidate_index,
             Some(ProgressStatus::InProgress),
+            Some("preparing candidate"),
             None,
         )?;
         prepare_wip_candidate_dir(&wip_dir, verbose)?;
@@ -249,6 +256,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 &run_dir,
                 candidate.candidate_index,
                 None,
+                None,
                 Some(progress_result_from_outcome(&outcome, true)),
             )?;
             progress.complete_candidate(candidate.candidate_index, 0, true);
@@ -262,6 +270,13 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             manifest.provider.as_str(),
             short_hash(&candidate.commit.id),
         );
+        update_candidate_progress(
+            &run_dir,
+            candidate.candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some("screen inventory"),
+            None,
+        )?;
         log_step(
             verbose,
             "candidate",
@@ -270,17 +285,25 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 manifest.provider, candidate.candidate_index
             ),
         );
-        let screening = if let Some(screen_artifacts) = &codex_screen_artifacts {
-            run_codex_screening(
+        let codex_screening_output = if let Some(screen_artifacts) = &codex_screen_artifacts {
+            Some(run_codex_screening_pipeline(
                 provider.as_ref(),
-                screen_artifacts,
                 &repo_root,
+                &screen_dir,
+                candidate,
+                screen_artifacts,
+                &run_dir,
                 &screen_schema,
-                candidate.candidate_index,
+                &reachability_review_schema,
                 args.model.as_deref(),
                 screen_effort,
                 verbose,
-            )?
+            )?)
+        } else {
+            None
+        };
+        let screening = if let Some(output) = &codex_screening_output {
+            output.screening.clone()
         } else {
             let screen_prompt = prompt::render_screen_prompt(&manifest.repo_root, candidate)?;
             provider.screen_candidate(ProviderRequest {
@@ -312,19 +335,19 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             let verify_dir = pass_dir(&wip_dir, AnalysisPhase::Verify);
             fs::create_dir_all(&verify_dir)
                 .with_context(|| format!("failed to create {}", verify_dir.display()))?;
-            let verify_prompt = prepare_verify_pass_artifacts(
-                args.provider,
-                &repo_root,
-                &verify_dir,
-                candidate,
-                &screening,
-            )?;
             progress.start_phase(
                 candidate.candidate_index,
                 AnalysisPhase::Verify,
                 manifest.provider.as_str(),
                 short_hash(&candidate.commit.id),
             );
+            update_candidate_progress(
+                &run_dir,
+                candidate.candidate_index,
+                Some(ProgressStatus::InProgress),
+                Some("verify adjudication"),
+                None,
+            )?;
             log_step(
                 verbose,
                 "candidate",
@@ -333,33 +356,82 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                     manifest.provider, candidate.candidate_index
                 ),
             );
-            let verification = provider.verify_candidate(ProviderRequest {
-                working_dir: if matches!(args.provider, ProviderKind::Codex) {
-                    &repo_root
+            let verification = if matches!(args.provider, ProviderKind::Codex) {
+                let Some(output) = &codex_screening_output else {
+                    bail!("missing Codex screening pipeline output for verification");
+                };
+                if let Some(prompt_input) = build_codex_verify_prompt_input(
+                    &repo_root,
+                    &verify_dir,
+                    candidate,
+                    &output.hotspot_plan,
+                    &output.reachability_results,
+                )? {
+                    let prompt_input_path =
+                        absolute_artifact_path(&verify_dir.join("prompt-input.json"))?;
+                    let verify_prompt =
+                        prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
+                    persist_pass_artifacts(&verify_dir, &prompt_input, &verify_prompt)?;
+                    Some(provider.verify_candidate(ProviderRequest {
+                        working_dir: &repo_root,
+                        prompt: &verify_prompt,
+                        schema: &verify_schema,
+                        pass_dir: &verify_dir,
+                        candidate_index: candidate.candidate_index,
+                        phase: AnalysisPhase::Verify,
+                        model: args.model.as_deref(),
+                        effort: verify_effort,
+                        verbose,
+                    })?)
                 } else {
-                    &verify_dir
-                },
-                prompt: &verify_prompt,
-                schema: &verify_schema,
-                pass_dir: &verify_dir,
-                candidate_index: candidate.candidate_index,
-                phase: AnalysisPhase::Verify,
-                model: args.model.as_deref(),
-                effort: verify_effort,
-                verbose,
-            })?;
+                    Some(VerificationAnalysis {
+                        verification_summary:
+                            "No reachability-reviewed hypotheses survived into adjudication."
+                                .to_owned(),
+                        verdict: crate::types::VerificationVerdict::Rejected,
+                        confirmed_findings: Vec::new(),
+                    })
+                }
+            } else {
+                let verify_prompt = prepare_verify_pass_artifacts(
+                    args.provider,
+                    &repo_root,
+                    &verify_dir,
+                    candidate,
+                    &screening,
+                )?;
+                Some(provider.verify_candidate(ProviderRequest {
+                    working_dir: &verify_dir,
+                    prompt: &verify_prompt,
+                    schema: &verify_schema,
+                    pass_dir: &verify_dir,
+                    candidate_index: candidate.candidate_index,
+                    phase: AnalysisPhase::Verify,
+                    model: args.model.as_deref(),
+                    effort: verify_effort,
+                    verbose,
+                })?)
+            };
             log_step(
                 verbose,
                 "candidate",
                 format!(
                     "candidate {:04} verify pass verdict={} confirmed {} finding(s)",
                     candidate.candidate_index,
-                    verification.verdict.as_str(),
-                    verification.confirmed_findings.len()
+                    verification
+                        .as_ref()
+                        .map(|analysis| analysis.verdict.as_str())
+                        .unwrap_or("rejected"),
+                    verification
+                        .as_ref()
+                        .map(|analysis| analysis.confirmed_findings.len())
+                        .unwrap_or(0)
                 ),
             );
-            persist_verification_analysis(&verify_dir, &verification)?;
-            Some(verification)
+            if let Some(verification) = &verification {
+                persist_verification_analysis(&verify_dir, verification)?;
+            }
+            verification
         };
 
         let outcome = CandidateOutcome {
@@ -373,6 +445,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         update_candidate_progress(
             &run_dir,
             candidate.candidate_index,
+            None,
             None,
             Some(progress_result_from_outcome(&outcome, keep_candidate_dir)),
         )?;
@@ -539,6 +612,13 @@ fn persist_verification_analysis(pass_dir: &Path, analysis: &VerificationAnalysi
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Persists one reachability analysis for a screened hypothesis.
+fn persist_reachability_analysis(pass_dir: &Path, analysis: &ReachabilityAnalysis) -> Result<()> {
+    let path = pass_dir.join("analysis.json");
+    fs::write(&path, serde_json::to_string_pretty(analysis)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Persists one completed candidate outcome.
 fn persist_candidate_outcome(candidate_dir: &Path, outcome: &CandidateOutcome) -> Result<()> {
     let path = candidate_dir.join("outcome.json");
@@ -593,18 +673,38 @@ struct CodexPromptCommit {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexScreenPlanPromptInput {
+struct CodexInventoryPlanPromptInput {
     candidate_index: usize,
     commit: CodexPromptCommit,
     hotspot_plan: HotspotPlan,
 }
 
 #[derive(Debug, Serialize)]
-struct CodexScreenClusterPromptInput {
+struct CodexInventoryClusterPromptInput {
     candidate_index: usize,
     commit: CodexPromptCommit,
     hotspot_plan: HotspotPlan,
     cluster: HotspotCluster,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexReachabilityPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+    cluster: HotspotCluster,
+    inventory_hypothesis: SuspiciousFinding,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodexAdjudicationCandidate {
+    hypothesis_index: usize,
+    cluster_title: String,
+    reachability_summary: String,
+    reachability_verdict: ReachabilityVerdict,
+    surface: ReachabilitySurface,
+    preconditions: Vec<String>,
+    refined_finding: SuspiciousFinding,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,7 +713,7 @@ struct CodexVerifyPromptInput {
     commit: CodexPromptCommit,
     commit_message: String,
     hotspot_plan: HotspotPlan,
-    screening_hypothesis: ScreeningAnalysis,
+    finalists: Vec<CodexAdjudicationCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -632,16 +732,52 @@ struct CodexEvidenceRefs {
 }
 
 #[derive(Debug, Clone)]
-struct CodexScreenClusterArtifacts {
+struct CodexInventoryClusterArtifacts {
     cluster: HotspotCluster,
     pass_dir: PathBuf,
     prompt: String,
 }
 
 #[derive(Debug, Clone)]
-struct CodexScreenPlanArtifacts {
+struct CodexInventoryPlanArtifacts {
+    full_patch: String,
     hotspot_plan: HotspotPlan,
-    clusters: Vec<CodexScreenClusterArtifacts>,
+    clusters: Vec<CodexInventoryClusterArtifacts>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexInventoryHypothesis {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    finding: SuspiciousFinding,
+}
+
+#[derive(Debug, Clone)]
+struct CodexReachabilityArtifacts {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    pass_dir: PathBuf,
+    prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexReachabilityRecord {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    analysis: ReachabilityAnalysis,
+}
+
+#[derive(Debug, Clone)]
+struct CodexInventoryMergeOutput {
+    analysis: ScreeningAnalysis,
+    hypotheses: Vec<CodexInventoryHypothesis>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexScreeningPipelineOutput {
+    screening: ScreeningAnalysis,
+    hotspot_plan: HotspotPlan,
+    reachability_results: Vec<CodexReachabilityRecord>,
 }
 
 /// Prepares one screening-pass prompt and pass artifacts for the selected provider.
@@ -676,14 +812,7 @@ fn prepare_verify_pass_artifacts(
     screening: &ScreeningAnalysis,
 ) -> Result<String> {
     match provider {
-        ProviderKind::Codex => {
-            let prompt_input =
-                build_codex_verify_prompt_input(repo_root, pass_dir, candidate, screening)?;
-            let prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
-            let prompt = prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
-            persist_pass_artifacts(pass_dir, &prompt_input, &prompt)?;
-            Ok(prompt)
-        }
+        ProviderKind::Codex => bail!("Codex verification artifacts require staged screening data"),
         ProviderKind::Claude => {
             let repo_root = repo_root.display().to_string();
             let prompt = prompt::render_verify_prompt(&repo_root, candidate, screening)?;
@@ -697,39 +826,50 @@ fn prepare_verify_pass_artifacts(
     }
 }
 
-/// Prepares one clustered Codex screening plan and its evidence bundles.
+/// Returns the inventory-stage artifact root for one screen pass.
+fn inventory_stage_dir(screen_dir: &Path) -> PathBuf {
+    screen_dir.join("inventory")
+}
+
+/// Returns the reachability-stage artifact root for one screen pass.
+fn reachability_stage_dir(screen_dir: &Path) -> PathBuf {
+    screen_dir.join("reachability")
+}
+
+/// Prepares one clustered Codex inventory plan and its evidence bundles.
 fn prepare_codex_screen_plan_artifacts(
     repo_root: &Path,
-    pass_dir: &Path,
+    screen_dir: &Path,
     candidate: &CommitCandidate,
-) -> Result<CodexScreenPlanArtifacts> {
+) -> Result<CodexInventoryPlanArtifacts> {
     let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
     let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
     let evidence = persist_codex_evidence_bundle(
-        pass_dir,
+        screen_dir,
         repo_root,
         candidate,
         &candidate.commit.files_changed,
         &full_patch,
         &hotspot_plan,
     )?;
-    let plan_prompt_input = CodexScreenPlanPromptInput {
+    let plan_prompt_input = CodexInventoryPlanPromptInput {
         candidate_index: candidate.candidate_index,
         commit: build_codex_prompt_commit(candidate, evidence),
         hotspot_plan: hotspot_plan.clone(),
     };
-    let plan_prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
+    let plan_prompt_input_path = absolute_artifact_path(&screen_dir.join("prompt-input.json"))?;
     let plan_prompt = prompt::render_codex_screen_plan_prompt(
         hotspot_plan.clusters.len(),
         Path::new(&plan_prompt_input_path),
     );
-    persist_pass_artifacts(pass_dir, &plan_prompt_input, &plan_prompt)?;
+    persist_pass_artifacts(screen_dir, &plan_prompt_input, &plan_prompt)?;
 
+    let inventory_dir = inventory_stage_dir(screen_dir);
+    fs::create_dir_all(&inventory_dir)
+        .with_context(|| format!("failed to create {}", inventory_dir.display()))?;
     let mut clusters = Vec::with_capacity(hotspot_plan.clusters.len());
     for cluster in &hotspot_plan.clusters {
-        let cluster_dir = pass_dir
-            .join("clusters")
-            .join(format!("cluster-{:04}", cluster.cluster_index));
+        let cluster_dir = inventory_dir.join(format!("cluster-{:04}", cluster.cluster_index));
         fs::create_dir_all(&cluster_dir)
             .with_context(|| format!("failed to create {}", cluster_dir.display()))?;
         let filtered_patch = hotspot::filtered_patch_for_files(&full_patch, &cluster.files);
@@ -741,7 +881,7 @@ fn prepare_codex_screen_plan_artifacts(
             &filtered_patch,
             &hotspot_plan,
         )?;
-        let prompt_input = CodexScreenClusterPromptInput {
+        let prompt_input = CodexInventoryClusterPromptInput {
             candidate_index: candidate.candidate_index,
             commit: build_codex_prompt_commit(candidate, evidence),
             hotspot_plan: hotspot_plan.clone(),
@@ -751,37 +891,124 @@ fn prepare_codex_screen_plan_artifacts(
         let prompt =
             prompt::render_codex_screen_cluster_prompt(cluster, Path::new(&prompt_input_path));
         persist_pass_artifacts(&cluster_dir, &prompt_input, &prompt)?;
-        clusters.push(CodexScreenClusterArtifacts {
+        clusters.push(CodexInventoryClusterArtifacts {
             cluster: cluster.clone(),
             pass_dir: cluster_dir,
             prompt,
         });
     }
 
-    Ok(CodexScreenPlanArtifacts {
+    Ok(CodexInventoryPlanArtifacts {
+        full_patch,
         hotspot_plan,
         clusters,
     })
 }
 
-/// Runs Codex screening across hotspot clusters and merges the results.
-fn run_codex_screening(
+/// Runs the staged Codex screening pipeline for one candidate.
+fn run_codex_screening_pipeline(
     provider: &dyn crate::provider::AgentProvider,
-    artifacts: &CodexScreenPlanArtifacts,
+    repo_root: &Path,
+    screen_dir: &Path,
+    candidate: &CommitCandidate,
+    artifacts: &CodexInventoryPlanArtifacts,
+    run_dir: &Path,
+    inventory_schema: &str,
+    reachability_schema: &str,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<CodexScreeningPipelineOutput> {
+    let inventory = run_codex_inventory(
+        provider,
+        artifacts,
+        repo_root,
+        run_dir,
+        inventory_schema,
+        candidate.candidate_index,
+        model,
+        effort,
+        verbose,
+    )?;
+    let inventory_dir = inventory_stage_dir(screen_dir);
+    persist_screening_analysis(&inventory_dir, &inventory.analysis)?;
+
+    if inventory.hypotheses.is_empty() {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: inventory.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+        });
+    }
+
+    update_candidate_progress(
+        run_dir,
+        candidate.candidate_index,
+        Some(ProgressStatus::InProgress),
+        Some("screen reachability"),
+        None,
+    )?;
+    let reachability_artifacts = prepare_codex_reachability_artifacts(
+        repo_root,
+        screen_dir,
+        candidate,
+        artifacts,
+        &inventory.hypotheses,
+    )?;
+    let reachability_results = run_codex_reachability(
+        provider,
+        repo_root,
+        &reachability_artifacts,
+        run_dir,
+        reachability_schema,
+        candidate.candidate_index,
+        model,
+        effort,
+        verbose,
+    )?;
+    let screening = merge_codex_reachability_results(
+        artifacts.hotspot_plan.clusters.len(),
+        &reachability_results,
+    );
+    let reachability_dir = reachability_stage_dir(screen_dir);
+    persist_screening_analysis(&reachability_dir, &screening)?;
+
+    Ok(CodexScreeningPipelineOutput {
+        screening,
+        hotspot_plan: artifacts.hotspot_plan.clone(),
+        reachability_results,
+    })
+}
+
+/// Runs Codex inventory across hotspot clusters and merges the results into hypotheses.
+fn run_codex_inventory(
+    provider: &dyn crate::provider::AgentProvider,
+    artifacts: &CodexInventoryPlanArtifacts,
     working_dir: &Path,
+    run_dir: &Path,
     schema: &str,
     candidate_index: usize,
     model: Option<&str>,
     effort: Option<crate::cli::ReasoningEffort>,
     verbose: bool,
-) -> Result<ScreeningAnalysis> {
+) -> Result<CodexInventoryMergeOutput> {
     let mut cluster_results = Vec::with_capacity(artifacts.clusters.len());
     for cluster_artifact in &artifacts.clusters {
+        update_candidate_progress(
+            run_dir,
+            candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some(&format!(
+                "screen inventory cluster {:04}",
+                cluster_artifact.cluster.cluster_index
+            )),
+            None,
+        )?;
         log_step(
             verbose,
-            "screen-cluster",
+            "inventory-cluster",
             format!(
-                "screening cluster {:04} ({})",
+                "inventory cluster {:04} ({})",
                 cluster_artifact.cluster.cluster_index, cluster_artifact.cluster.title
             ),
         );
@@ -800,27 +1027,27 @@ fn run_codex_screening(
         cluster_results.push((cluster_artifact.cluster.clone(), analysis));
     }
 
-    Ok(merge_codex_screening_results(
+    Ok(merge_codex_inventory_results(
         artifacts.hotspot_plan.clusters.len(),
         cluster_results,
     ))
 }
 
-/// Merges clustered Codex screening results into one candidate-level analysis.
-fn merge_codex_screening_results(
+/// Merges clustered Codex inventory results into a deduplicated hypothesis list.
+fn merge_codex_inventory_results(
     cluster_count: usize,
     cluster_results: Vec<(HotspotCluster, ScreeningAnalysis)>,
-) -> ScreeningAnalysis {
-    let mut findings = Vec::new();
+) -> CodexInventoryMergeOutput {
+    let mut deduped = Vec::new();
     let mut seen = BTreeSet::new();
     let mut positive_clusters = Vec::new();
 
-    for (cluster, analysis) in &cluster_results {
+    for (cluster, analysis) in cluster_results {
         if !analysis.suspicious_findings.is_empty() {
             positive_clusters.push(cluster.title.clone());
         }
 
-        for finding in &analysis.suspicious_findings {
+        for finding in analysis.suspicious_findings {
             let key = format!(
                 "{}|{}|{}",
                 finding.commit_id.to_ascii_lowercase(),
@@ -832,54 +1059,343 @@ fn merge_codex_screening_results(
                     .to_ascii_lowercase()
             );
             if seen.insert(key) {
-                findings.push(finding.clone());
+                deduped.push(CodexInventoryHypothesis {
+                    hypothesis_index: 0,
+                    cluster: cluster.clone(),
+                    finding,
+                });
             }
         }
+    }
+    deduped.sort_by(|left, right| {
+        right
+            .finding
+            .confidence
+            .partial_cmp(&left.finding.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.finding.title.cmp(&right.finding.title))
+    });
+    for (hypothesis_index, hypothesis) in deduped.iter_mut().enumerate() {
+        hypothesis.hypothesis_index = hypothesis_index;
     }
 
     let candidate_summary = if positive_clusters.is_empty() {
         format!(
-            "Screened {} hotspot cluster(s). No cluster produced a stable security hypothesis from the supplied evidence.",
+            "Inventoried {} hotspot cluster(s). No cluster produced a stable security hypothesis from the supplied evidence.",
             cluster_count
         )
     } else {
         format!(
-            "Screened {} hotspot cluster(s). Plausible security hypotheses came from: {}.",
+            "Inventoried {} hotspot cluster(s). Plausible security hypotheses came from: {}.",
             cluster_count,
             positive_clusters.join("; ")
         )
     };
 
-    ScreeningAnalysis {
-        candidate_summary,
-        suspicious_findings: findings,
+    CodexInventoryMergeOutput {
+        analysis: ScreeningAnalysis {
+            candidate_summary,
+            suspicious_findings: deduped
+                .iter()
+                .map(|hypothesis| hypothesis.finding.clone())
+                .collect(),
+        },
+        hypotheses: deduped,
     }
 }
 
-/// Builds the Codex verification-pass prompt input after persisting a pass-local evidence bundle.
+/// Prepares one reachability bundle for each inventoried hypothesis.
+fn prepare_codex_reachability_artifacts(
+    repo_root: &Path,
+    screen_dir: &Path,
+    candidate: &CommitCandidate,
+    artifacts: &CodexInventoryPlanArtifacts,
+    hypotheses: &[CodexInventoryHypothesis],
+) -> Result<Vec<CodexReachabilityArtifacts>> {
+    let reachability_dir = reachability_stage_dir(screen_dir);
+    fs::create_dir_all(&reachability_dir)
+        .with_context(|| format!("failed to create {}", reachability_dir.display()))?;
+
+    let mut outputs = Vec::with_capacity(hypotheses.len());
+    for hypothesis in hypotheses {
+        let hypothesis_dir =
+            reachability_dir.join(format!("hypothesis-{:04}", hypothesis.hypothesis_index));
+        fs::create_dir_all(&hypothesis_dir)
+            .with_context(|| format!("failed to create {}", hypothesis_dir.display()))?;
+        let selected_files = selected_files_for_hypothesis(hypothesis);
+        let filtered_patch = filtered_patch_for_selection(&artifacts.full_patch, &selected_files);
+        let evidence = persist_codex_evidence_bundle(
+            &hypothesis_dir,
+            repo_root,
+            candidate,
+            &selected_files,
+            &filtered_patch,
+            &artifacts.hotspot_plan,
+        )?;
+        let prompt_input = CodexReachabilityPromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            cluster: hypothesis.cluster.clone(),
+            inventory_hypothesis: hypothesis.finding.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&hypothesis_dir.join("prompt-input.json"))?;
+        let prompt = prompt::render_codex_reachability_prompt(Path::new(&prompt_input_path));
+        persist_pass_artifacts(&hypothesis_dir, &prompt_input, &prompt)?;
+        outputs.push(CodexReachabilityArtifacts {
+            hypothesis_index: hypothesis.hypothesis_index,
+            cluster: hypothesis.cluster.clone(),
+            pass_dir: hypothesis_dir,
+            prompt,
+        });
+    }
+
+    Ok(outputs)
+}
+
+/// Runs one reachability review for each inventoried hypothesis.
+fn run_codex_reachability(
+    provider: &dyn crate::provider::AgentProvider,
+    working_dir: &Path,
+    artifacts: &[CodexReachabilityArtifacts],
+    run_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<Vec<CodexReachabilityRecord>> {
+    let mut results = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        update_candidate_progress(
+            run_dir,
+            candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some(&format!(
+                "screen reachability hypothesis {:04}",
+                artifact.hypothesis_index
+            )),
+            None,
+        )?;
+        log_step(
+            verbose,
+            "reachability",
+            format!(
+                "reviewing hypothesis {:04} from cluster {}",
+                artifact.hypothesis_index, artifact.cluster.title
+            ),
+        );
+        let analysis = provider.review_reachability(ProviderRequest {
+            working_dir,
+            prompt: &artifact.prompt,
+            schema,
+            pass_dir: &artifact.pass_dir,
+            candidate_index,
+            phase: AnalysisPhase::Screen,
+            model,
+            effort,
+            verbose,
+        })?;
+        persist_reachability_analysis(&artifact.pass_dir, &analysis)?;
+        results.push(CodexReachabilityRecord {
+            hypothesis_index: artifact.hypothesis_index,
+            cluster: artifact.cluster.clone(),
+            analysis,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Merges reachability-reviewed hypotheses into the final screening result.
+fn merge_codex_reachability_results(
+    cluster_count: usize,
+    reachability_results: &[CodexReachabilityRecord],
+) -> ScreeningAnalysis {
+    let mut supported = Vec::new();
+    let mut surfaces = Vec::new();
+
+    for result in reachability_results {
+        if result.analysis.verdict == ReachabilityVerdict::Rejected {
+            continue;
+        }
+
+        if let Some(finding) = &result.analysis.refined_finding {
+            supported.push((
+                result.analysis.verdict,
+                result.analysis.surface,
+                finding.clone(),
+            ));
+            surfaces.push(format!(
+                "{} [{}]",
+                result.cluster.title,
+                result.analysis.surface.as_str()
+            ));
+        }
+    }
+
+    supported.sort_by(|left, right| {
+        reachability_verdict_priority(right.0)
+            .cmp(&reachability_verdict_priority(left.0))
+            .then_with(|| {
+                reachability_surface_priority(right.1).cmp(&reachability_surface_priority(left.1))
+            })
+            .then_with(|| {
+                right
+                    .2
+                    .confidence
+                    .partial_cmp(&left.2.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let candidate_summary = if supported.is_empty() {
+        format!(
+            "Reviewed {} hotspot cluster(s) through staged reachability analysis. No hypothesis kept a stable attacker-controlled path.",
+            cluster_count
+        )
+    } else {
+        format!(
+            "Reviewed {} hotspot cluster(s) through staged reachability analysis. Surviving hypotheses came from: {}.",
+            cluster_count,
+            surfaces.join("; ")
+        )
+    };
+
+    ScreeningAnalysis {
+        candidate_summary,
+        suspicious_findings: supported
+            .into_iter()
+            .map(|(_, _, finding)| finding)
+            .collect(),
+    }
+}
+
+/// Selects the files and snapshots needed to review one inventoried hypothesis.
+fn selected_files_for_hypothesis(hypothesis: &CodexInventoryHypothesis) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in &hypothesis.cluster.files {
+        selected.insert(path.clone());
+    }
+    for path in &hypothesis.finding.affected_files {
+        selected.insert(path.clone());
+    }
+    selected.into_iter().collect()
+}
+
+/// Returns the patch subset for one selected file list, or the full patch when filtering is empty.
+fn filtered_patch_for_selection(full_patch: &str, selected_files: &[String]) -> String {
+    let filtered = hotspot::filtered_patch_for_files(full_patch, selected_files);
+    if filtered.trim().is_empty() {
+        full_patch.to_owned()
+    } else {
+        filtered
+    }
+}
+
+/// Returns the ranking priority for one reachability verdict.
+fn reachability_verdict_priority(verdict: ReachabilityVerdict) -> usize {
+    match verdict {
+        ReachabilityVerdict::Supported => 3,
+        ReachabilityVerdict::Weak => 2,
+        ReachabilityVerdict::Rejected => 1,
+    }
+}
+
+/// Returns the ranking priority for one reachability surface.
+fn reachability_surface_priority(surface: ReachabilitySurface) -> usize {
+    match surface {
+        ReachabilitySurface::Remote => 5,
+        ReachabilitySurface::Adjacent => 4,
+        ReachabilitySurface::LocalApi => 3,
+        ReachabilitySurface::Unknown => 2,
+        ReachabilitySurface::InternalOnly => 1,
+    }
+}
+
+/// Shortlists adjudication finalists under a serialized byte budget.
+fn select_adjudication_finalists(
+    reachability_results: &[CodexReachabilityRecord],
+) -> Result<Vec<CodexAdjudicationCandidate>> {
+    let mut finalists = reachability_results
+        .iter()
+        .filter_map(|result| {
+            let refined_finding = result.analysis.refined_finding.clone()?;
+            if result.analysis.verdict == ReachabilityVerdict::Rejected {
+                return None;
+            }
+
+            Some(CodexAdjudicationCandidate {
+                hypothesis_index: result.hypothesis_index,
+                cluster_title: result.cluster.title.clone(),
+                reachability_summary: result.analysis.hypothesis_summary.clone(),
+                reachability_verdict: result.analysis.verdict,
+                surface: result.analysis.surface,
+                preconditions: result.analysis.preconditions.clone(),
+                refined_finding,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    finalists.sort_by(|left, right| {
+        reachability_verdict_priority(right.reachability_verdict)
+            .cmp(&reachability_verdict_priority(left.reachability_verdict))
+            .then_with(|| {
+                reachability_surface_priority(right.surface)
+                    .cmp(&reachability_surface_priority(left.surface))
+            })
+            .then_with(|| {
+                right
+                    .refined_finding
+                    .confidence
+                    .partial_cmp(&left.refined_finding.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut selected = Vec::new();
+    let mut total_bytes = 0usize;
+    for finalist in finalists {
+        let bytes = serde_json::to_vec(&finalist)?.len();
+        if !selected.is_empty() && total_bytes + bytes > MAX_ADJUDICATION_INPUT_BYTES {
+            break;
+        }
+        total_bytes += bytes;
+        selected.push(finalist);
+    }
+
+    Ok(selected)
+}
+
+/// Builds the Codex adjudication-pass prompt input after shortlisting finalists by budget.
 fn build_codex_verify_prompt_input(
     repo_root: &Path,
     pass_dir: &Path,
     candidate: &CommitCandidate,
-    screening: &ScreeningAnalysis,
-) -> Result<CodexVerifyPromptInput> {
+    hotspot_plan: &HotspotPlan,
+    reachability_results: &[CodexReachabilityRecord],
+) -> Result<Option<CodexVerifyPromptInput>> {
+    let finalists = select_adjudication_finalists(reachability_results)?;
+    if finalists.is_empty() {
+        return Ok(None);
+    }
+
     let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
-    let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
     let evidence = persist_codex_evidence_bundle(
         pass_dir,
         repo_root,
         candidate,
         &candidate.commit.files_changed,
         &full_patch,
-        &hotspot_plan,
+        hotspot_plan,
     )?;
-    Ok(CodexVerifyPromptInput {
+    Ok(Some(CodexVerifyPromptInput {
         candidate_index: candidate.candidate_index,
         commit: build_codex_prompt_commit(candidate, evidence),
         commit_message: candidate.commit.summary.clone(),
-        hotspot_plan,
-        screening_hypothesis: screening.clone(),
-    })
+        hotspot_plan: hotspot_plan.clone(),
+        finalists,
+    }))
 }
 
 /// Builds the Codex-facing commit summary that points to persisted evidence files.
@@ -1083,6 +1599,7 @@ fn initialize_progress_state(run_dir: &Path, candidates: &[CommitCandidate]) -> 
                 commit_id: candidate.commit.id.clone(),
                 short_id: candidate.commit.short_id.clone(),
                 status: ProgressStatus::Pending,
+                active_stage: None,
             })
             .collect(),
         complete: Vec::new(),
@@ -1095,6 +1612,7 @@ fn update_candidate_progress(
     run_dir: &Path,
     candidate_index: usize,
     pending_status: Option<ProgressStatus>,
+    active_stage: Option<&str>,
     result: Option<ProgressResult>,
 ) -> Result<()> {
     let mut progress = load_progress_state(run_dir)?;
@@ -1110,6 +1628,7 @@ fn update_candidate_progress(
                         commit_id: candidate.commit_id.clone(),
                         short_id: candidate.short_id.clone(),
                         status: ProgressStatus::Pending,
+                        active_stage: None,
                     })
             })
             .with_context(|| format!("missing candidate {candidate_index:04} in progress.json"))?;
@@ -1123,13 +1642,16 @@ fn update_candidate_progress(
                 result,
             },
         );
-    } else if let Some(status) = pending_status {
+    } else if pending_status.is_some() || active_stage.is_some() {
         let candidate = progress
             .pending
             .iter_mut()
             .find(|candidate| candidate.candidate_index == candidate_index)
             .with_context(|| format!("missing candidate {candidate_index:04} in progress.json"))?;
-        candidate.status = status;
+        if let Some(status) = pending_status {
+            candidate.status = status;
+        }
+        candidate.active_stage = active_stage.map(ToOwned::to_owned);
     }
 
     refresh_progress_counts(&mut progress);
@@ -1180,6 +1702,7 @@ fn reconcile_progress_state(progress: &mut ProgressState, candidates: &[CommitCa
             commit_id: candidate.commit.id.clone(),
             short_id: candidate.commit.short_id.clone(),
             status: ProgressStatus::Pending,
+            active_stage: None,
         });
     }
 
@@ -1586,6 +2109,7 @@ mod tests {
             &dir,
             0,
             None,
+            None,
             Some(ProgressResult {
                 candidate_summary: "summary".into(),
                 finding_count: 0,
@@ -1617,6 +2141,7 @@ mod tests {
         super::update_candidate_progress(
             &dir,
             0,
+            None,
             None,
             Some(ProgressResult {
                 candidate_summary: "legacy summary".into(),

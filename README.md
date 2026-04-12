@@ -62,14 +62,21 @@ By default, VCamper suppresses provider event output in the terminal. The defaul
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
-For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Screening now derives a ranked hotspot plan from the full patch, splits large commits into up to four hotspot clusters, and screens each cluster separately before merging the candidate-level hypotheses. That keeps the screen pass closer to commit-local analysis, avoids losing diff context to prompt-size truncation, and gives verification alternative hypotheses to test when the first explanation fails.
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as three staged invocations inside each candidate:
 
-VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`.
+- inventory: derive a ranked hotspot plan from the full patch and inventory distinct hypotheses per hotspot cluster
+- reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface
+- adjudication: compare only the shortlisted reachability survivors and pick the strongest supported finding, or reject them all
 
-The analysis flow is two-pass:
+That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count.
 
-- screen: code-first commit screening with commit messages withheld
-- verify: skeptical verification for commits the screener escalates, with the commit message restored as secondary context
+VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, reachability, or adjudication.
+
+The analysis flow is still reported as `screen` then `verify`, but Codex internally expands that into:
+
+- `screen/inventory`: code-first clustered hypothesis inventory with commit messages withheld
+- `screen/reachability`: one-hypothesis exploit-path review with compact bundles
+- `verify`: final adjudication over reachability-shortlisted finalists, with the commit message restored as secondary context
 
 ## Requirements
 
@@ -84,7 +91,7 @@ The analysis flow is two-pass:
 VCamper requires `--out` for every run. Each output directory contains:
 
 - `manifest.json`: selected repo, range, and CLI settings
-- `progress.json`: pretty-printed pending and complete candidate lists with top-level counters
+- `progress.json`: pretty-printed pending and complete candidate lists with top-level counters and per-candidate `active_stage`
 - `wip/candidate-*`: in-progress candidate artifacts that have not completed yet
 - `candidate-*/input.json`: collected commit evidence artifact for a completed candidate
 - `candidate-*/screen/prompt-input.json`: code-first screener evidence exposed to the provider prompt
@@ -94,12 +101,17 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `candidate-*/screen/evidence/hotspots.json`: ranked hotspot files and screening clusters derived from the full patch
 - `candidate-*/screen/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
 - `candidate-*/screen/evidence/before/*` and `candidate-*/screen/evidence/after/*`: file snapshots available to Codex during screening
-- `candidate-*/screen/clusters/cluster-*/prompt-input.json` and `prompt.txt`: cluster-specific screener evidence and prompt
-- `candidate-*/screen/clusters/cluster-*/evidence/*`: filtered patch, hotspot plan, and snapshots for one screening cluster
-- `candidate-*/screen/clusters/cluster-*/analysis.json`: per-cluster screener result before candidate-level merging
+- `candidate-*/screen/inventory/cluster-*/prompt-input.json` and `prompt.txt`: cluster-specific inventory evidence and prompt
+- `candidate-*/screen/inventory/cluster-*/evidence/*`: filtered patch, hotspot plan, and snapshots for one inventory cluster
+- `candidate-*/screen/inventory/cluster-*/analysis.json`: per-cluster inventory result before candidate-level merging
+- `candidate-*/screen/inventory/analysis.json`: merged inventory result before reachability filtering
+- `candidate-*/screen/reachability/hypothesis-*/prompt-input.json` and `prompt.txt`: one-hypothesis reachability evidence and prompt
+- `candidate-*/screen/reachability/hypothesis-*/evidence/*`: hypothesis-local patch subset, hotspot plan, and snapshots
+- `candidate-*/screen/reachability/hypothesis-*/analysis.json`: one reachability verdict and refined finding
+- `candidate-*/screen/reachability/analysis.json`: merged screening result after reachability filtering
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output
-- `candidate-*/screen/analysis.json`: completed screener result
-- `candidate-*/verify/prompt-input.json`: verifier evidence including the screener hypothesis and commit message
+- `candidate-*/screen/analysis.json`: completed screening result after staged inventory and reachability
+- `candidate-*/verify/prompt-input.json`: adjudication evidence including shortlisted finalists and the commit message
 - `candidate-*/verify/prompt.txt`: rendered verifier prompt
 - `candidate-*/verify/evidence/patch.diff`: full untruncated patch for the verification pass
 - `candidate-*/verify/evidence/changed-files.txt`: changed file list for the verification pass

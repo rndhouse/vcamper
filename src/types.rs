@@ -70,6 +70,62 @@ pub(crate) struct VerificationAnalysis {
     pub(crate) confirmed_findings: Vec<SuspiciousFinding>,
 }
 
+/// Reachability review for one screened hypothesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReachabilityAnalysis {
+    /// Short provider summary for the reviewed hypothesis.
+    pub(crate) hypothesis_summary: String,
+    /// Reachability verdict for the reviewed hypothesis.
+    pub(crate) verdict: ReachabilityVerdict,
+    /// Strongest supported attack surface for the hypothesis.
+    pub(crate) surface: ReachabilitySurface,
+    /// Preconditions that must hold for the hypothesis to matter.
+    pub(crate) preconditions: Vec<String>,
+    /// Refined finding when the hypothesis remains security-relevant.
+    pub(crate) refined_finding: Option<SuspiciousFinding>,
+}
+
+/// Reachability verdict for one screened hypothesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReachabilityVerdict {
+    /// The reviewed hypothesis has a concrete attack path in the supplied code.
+    Supported,
+    /// The reviewed hypothesis still looks security-relevant, but exploitability remains weak.
+    Weak,
+    /// The reviewed hypothesis does not hold up as a security issue.
+    Rejected,
+}
+
+/// Strongest supported attack surface for one reviewed hypothesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReachabilitySurface {
+    /// A remote or network-originating attacker can plausibly reach the changed path.
+    Remote,
+    /// A nearby peer or delegated protocol participant can plausibly reach the changed path.
+    Adjacent,
+    /// The issue depends on an application exposing a public local API to attacker-controlled data.
+    LocalApi,
+    /// The issue only affects internal-only callers or non-attacker-controlled code paths.
+    InternalOnly,
+    /// The supplied evidence does not support a stable exposure classification.
+    Unknown,
+}
+
+impl ReachabilitySurface {
+    /// Returns the lowercase surface label used in logs and summaries.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Adjacent => "adjacent",
+            Self::LocalApi => "local_api",
+            Self::InternalOnly => "internal_only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Final verifier verdict for one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +246,8 @@ pub(crate) struct ProgressPendingCandidate {
     pub(crate) short_id: String,
     /// Current persisted status for the unfinished candidate.
     pub(crate) status: ProgressStatus,
+    /// Optional detailed stage label for staged Codex execution.
+    pub(crate) active_stage: Option<String>,
 }
 
 /// Persisted completed status for one commit candidate.

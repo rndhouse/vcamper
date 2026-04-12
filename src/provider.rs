@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::cli::{ProviderKind, ReasoningEffort};
-use crate::types::{ScreeningAnalysis, VerificationAnalysis};
+use crate::types::{ReachabilityAnalysis, ScreeningAnalysis, VerificationAnalysis};
 
 /// Provider invocation request for one commit candidate.
 pub(crate) struct ProviderRequest<'a> {
@@ -59,6 +59,9 @@ impl AnalysisPhase {
 pub(crate) trait AgentProvider {
     /// Runs the first-pass screener for one commit candidate.
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis>;
+
+    /// Runs one reachability review for a screened hypothesis.
+    fn review_reachability(&self, request: ProviderRequest<'_>) -> Result<ReachabilityAnalysis>;
 
     /// Runs the second-pass verifier for one commit candidate.
     fn verify_candidate(&self, request: ProviderRequest<'_>) -> Result<VerificationAnalysis>;
@@ -172,11 +175,78 @@ pub(crate) fn verification_schema() -> Result<String> {
     }))?)
 }
 
+/// Returns the structured output schema required from reachability-review passes.
+pub(crate) fn reachability_schema() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "hypothesis_summary": { "type": "string" },
+            "verdict": {
+                "type": "string",
+                "enum": ["supported", "weak", "rejected"]
+            },
+            "surface": {
+                "type": "string",
+                "enum": ["remote", "adjacent", "local_api", "internal_only", "unknown"]
+            },
+            "preconditions": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "refined_finding": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "properties": {
+                    "title": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "commit_id": { "type": "string" },
+                    "rationale": { "type": "string" },
+                    "likely_bug_class": { "type": ["string", "null"] },
+                    "affected_files": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "follow_up": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": [
+                    "title",
+                    "confidence",
+                    "commit_id",
+                    "rationale",
+                    "likely_bug_class",
+                    "affected_files",
+                    "evidence",
+                    "follow_up"
+                ]
+            }
+        },
+        "required": [
+            "hypothesis_summary",
+            "verdict",
+            "surface",
+            "preconditions",
+            "refined_finding"
+        ]
+    }))?)
+}
+
 /// Codex CLI adapter.
 struct CodexProvider;
 
 impl AgentProvider for CodexProvider {
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis> {
+        run_codex_structured(request)
+    }
+
+    fn review_reachability(&self, request: ProviderRequest<'_>) -> Result<ReachabilityAnalysis> {
         run_codex_structured(request)
     }
 
@@ -190,6 +260,10 @@ struct ClaudeProvider;
 
 impl AgentProvider for ClaudeProvider {
     fn screen_candidate(&self, request: ProviderRequest<'_>) -> Result<ScreeningAnalysis> {
+        run_claude_structured(request)
+    }
+
+    fn review_reachability(&self, request: ProviderRequest<'_>) -> Result<ReachabilityAnalysis> {
         run_claude_structured(request)
     }
 
