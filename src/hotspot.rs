@@ -4,13 +4,13 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_CLUSTERS: usize = 4;
 const MIN_CLUSTER_SCORE: usize = 8;
 
 /// Ranked hotspot plan for one commit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HotspotPlan {
     /// Ranked file-level hotspots extracted from the full patch.
     pub(crate) files: Vec<HotspotFile>,
@@ -19,7 +19,7 @@ pub(crate) struct HotspotPlan {
 }
 
 /// One file-level hotspot extracted from the full patch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HotspotFile {
     /// Repository-relative file path.
     pub(crate) path: String,
@@ -36,7 +36,7 @@ pub(crate) struct HotspotFile {
 }
 
 /// One screening cluster derived from related hotspot files.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HotspotCluster {
     /// Zero-based cluster index within the plan.
     pub(crate) cluster_index: usize,

@@ -86,9 +86,17 @@ pub(crate) struct AnalyzeArgs {
     #[arg(long, value_enum)]
     pub(crate) stop_after_stage: Option<PipelineStage>,
 
+    /// Start execution at the selected staged analysis step and reuse earlier artifacts.
+    #[arg(long, value_enum)]
+    pub(crate) start_at_stage: Option<PipelineStage>,
+
     /// Restrict Codex inventory to specific hotspot focus indexes.
     #[arg(long, value_delimiter = ',')]
     pub(crate) inventory_focuses: Vec<usize>,
+
+    /// Force rerunning the selected stages and all later dependent stages.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub(crate) rerun_stages: Vec<PipelineStage>,
 }
 
 /// Agent providers supported by the CLI proof of concept.
@@ -121,6 +129,7 @@ pub(crate) enum ReasoningEffort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PipelineStage {
     Inventory,
+    Synthesis,
     Interaction,
     Reachability,
     Verify,
@@ -131,9 +140,21 @@ impl PipelineStage {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Inventory => "inventory",
+            Self::Synthesis => "synthesis",
             Self::Interaction => "interaction",
             Self::Reachability => "reachability",
             Self::Verify => "verify",
+        }
+    }
+
+    /// Returns the fixed pipeline order for stage comparisons.
+    pub(crate) fn order(self) -> usize {
+        match self {
+            Self::Inventory => 0,
+            Self::Synthesis => 1,
+            Self::Interaction => 2,
+            Self::Reachability => 3,
+            Self::Verify => 4,
         }
     }
 }
@@ -188,7 +209,9 @@ mod tests {
         assert_eq!(args.max_patch_bytes, 40_000);
         assert_eq!(args.min_confidence, 0.65);
         assert_eq!(args.stop_after_stage, None);
+        assert_eq!(args.start_at_stage, None);
         assert!(args.inventory_focuses.is_empty());
+        assert!(args.rerun_stages.is_empty());
     }
 
     #[test]
@@ -215,6 +238,29 @@ mod tests {
     }
 
     #[test]
+    fn analyze_parses_start_at_stage() {
+        let cli = Cli::parse_from([
+            "vcamper",
+            "analyze",
+            "--repo",
+            ".",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--provider",
+            "codex",
+            "--out",
+            "out",
+            "--start-at-stage",
+            "interaction",
+        ]);
+
+        let Commands::Analyze(args) = cli.command;
+        assert_eq!(args.start_at_stage, Some(PipelineStage::Interaction));
+    }
+
+    #[test]
     fn analyze_parses_inventory_focuses() {
         let cli = Cli::parse_from([
             "vcamper",
@@ -235,5 +281,31 @@ mod tests {
 
         let Commands::Analyze(args) = cli.command;
         assert_eq!(args.inventory_focuses, vec![0, 1, 4, 9]);
+    }
+
+    #[test]
+    fn analyze_parses_rerun_stages() {
+        let cli = Cli::parse_from([
+            "vcamper",
+            "analyze",
+            "--repo",
+            ".",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--provider",
+            "codex",
+            "--out",
+            "out",
+            "--rerun-stages",
+            "interaction,verify",
+        ]);
+
+        let Commands::Analyze(args) = cli.command;
+        assert_eq!(
+            args.rerun_stages,
+            vec![PipelineStage::Interaction, PipelineStage::Verify]
+        );
     }
 }

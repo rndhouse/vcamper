@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::{AnalyzeArgs, Cli, Commands, PipelineStage, ProviderKind};
 use crate::git;
@@ -21,14 +21,52 @@ use crate::provider::{
 };
 use crate::report;
 use crate::types::{
-    CandidateOutcome, CommitCandidate, FileStat, InteractionAnalysis, InteractionKind,
-    InteractionVerdict, ProgressCompleteCandidate, ProgressPendingCandidate, ProgressResult,
-    ProgressState, ProgressStatus, ReachabilityAnalysis, ReachabilityAssessment,
+    CandidateOutcome, CandidateStageState, CommitCandidate, FileStat, InteractionAnalysis,
+    InteractionKind, InteractionVerdict, ProgressCompleteCandidate, ProgressPendingCandidate,
+    ProgressResult, ProgressState, ProgressStatus, ReachabilityAnalysis, ReachabilityAssessment,
     ReachabilitySurface, ReachabilityVerdict, RunManifest, ScreeningAnalysis, SuspiciousFinding,
     VerificationAnalysis,
 };
 
 const MAX_ADJUDICATION_INPUT_BYTES: usize = 28_000;
+
+#[derive(Debug, Clone, Copy)]
+struct StageExecutionPlan {
+    start_at: PipelineStage,
+    stop_after: PipelineStage,
+    rerun_from: Option<PipelineStage>,
+}
+
+impl StageExecutionPlan {
+    fn from_args(args: &AnalyzeArgs) -> Self {
+        let start_at = args.start_at_stage.unwrap_or(PipelineStage::Inventory);
+        let stop_after = args.stop_after_stage.unwrap_or(PipelineStage::Verify);
+        let rerun_from = args
+            .rerun_stages
+            .iter()
+            .copied()
+            .min_by_key(|stage| stage.order());
+        Self {
+            start_at,
+            stop_after,
+            rerun_from,
+        }
+    }
+
+    fn includes(self, stage: PipelineStage) -> bool {
+        stage.order() >= self.start_at.order() && stage.order() <= self.stop_after.order()
+    }
+
+    fn stops_after(self, stage: PipelineStage) -> bool {
+        self.stop_after == stage
+    }
+
+    fn should_rerun(self, stage: PipelineStage) -> bool {
+        self.rerun_from
+            .map(|rerun_from| stage.order() >= rerun_from.order())
+            .unwrap_or(false)
+    }
+}
 
 /// Runs the selected CLI command.
 pub(crate) fn run(cli: Cli) -> Result<()> {
@@ -41,6 +79,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
 fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     validate_args(&args)?;
     let verbose = args.verbose;
+    let execution_plan = StageExecutionPlan::from_args(&args);
 
     log_step(
         verbose,
@@ -98,7 +137,13 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         max_patch_bytes: args.max_patch_bytes,
         dry_run: args.dry_run,
         stop_after_stage: args.stop_after_stage.map(|stage| stage.as_str().to_owned()),
+        start_at_stage: args.start_at_stage.map(|stage| stage.as_str().to_owned()),
         inventory_focuses: args.inventory_focuses.clone(),
+        rerun_stages: args
+            .rerun_stages
+            .iter()
+            .map(|stage| stage.as_str().to_owned())
+            .collect(),
     };
     ensure_manifest(&run_dir, &manifest, verbose)?;
     log_step(
@@ -131,6 +176,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     initialize_progress_state(&run_dir, &candidates)?;
 
     let screen_schema = screening_schema()?;
+    let synthesis_schema = screening_schema()?;
     let interaction_review_schema = interaction_schema()?;
     let reachability_review_schema = reachability_schema()?;
     let verify_schema = verification_schema()?;
@@ -153,12 +199,29 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         );
 
         if resume_from_candidate.is_none() {
-            if let Some(saved_outcome) = load_saved_candidate_outcome(
-                &run_dir,
-                &completed_dir,
-                candidate.candidate_index,
-                verbose,
-            )? {
+            let saved_outcome = match args.provider {
+                ProviderKind::Claude => load_saved_candidate_outcome(
+                    &run_dir,
+                    &completed_dir,
+                    candidate.candidate_index,
+                    verbose,
+                )?,
+                ProviderKind::Codex => {
+                    if completed_dir.exists()
+                        && candidate_request_satisfied(&completed_dir, execution_plan)?
+                    {
+                        load_saved_candidate_outcome(
+                            &run_dir,
+                            &completed_dir,
+                            candidate.candidate_index,
+                            verbose,
+                        )?
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(saved_outcome) = saved_outcome {
                 update_candidate_progress(
                     &run_dir,
                     candidate.candidate_index,
@@ -209,7 +272,12 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             Some("preparing candidate"),
             None,
         )?;
-        prepare_wip_candidate_dir(&wip_dir, verbose)?;
+        prepare_candidate_work_dir(&wip_dir, &completed_dir, verbose)?;
+        if matches!(args.provider, ProviderKind::Codex)
+            && let Some(rerun_from) = execution_plan.rerun_from
+        {
+            clear_stage_artifacts(&wip_dir, rerun_from, verbose)?;
+        }
 
         let screen_dir = pass_dir(&wip_dir, AnalysisPhase::Screen);
         fs::create_dir_all(&screen_dir)
@@ -300,11 +368,12 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 screen_artifacts,
                 &run_dir,
                 &screen_schema,
+                &synthesis_schema,
                 &interaction_review_schema,
                 &reachability_review_schema,
                 args.model.as_deref(),
                 screen_effort,
-                args.stop_after_stage,
+                execution_plan,
                 verbose,
             )?)
         } else {
@@ -336,14 +405,20 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             ),
         );
         persist_screening_analysis(&screen_dir, &screening)?;
+        let codex_screening_state =
+            codex_screening_output
+                .as_ref()
+                .map(|output| CandidateStageState {
+                    highest_completed_stage: output.highest_completed_stage.as_str().to_owned(),
+                    pipeline_complete: output.pipeline_complete,
+                });
+        if let Some(stage_state) = &codex_screening_state {
+            persist_candidate_stage_state(&wip_dir, stage_state)?;
+        }
 
         let verification = if screening.suspicious_findings.is_empty()
-            || matches!(
-                args.stop_after_stage,
-                Some(PipelineStage::Inventory)
-                    | Some(PipelineStage::Interaction)
-                    | Some(PipelineStage::Reachability)
-            ) {
+            || !execution_plan.includes(PipelineStage::Verify)
+        {
             None
         } else {
             let verify_dir = pass_dir(&wip_dir, AnalysisPhase::Verify);
@@ -374,37 +449,43 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 let Some(output) = &codex_screening_output else {
                     bail!("missing Codex screening pipeline output for verification");
                 };
-                if let Some(prompt_input) = build_codex_verify_prompt_input(
-                    &repo_root,
-                    &verify_dir,
-                    candidate,
-                    &output.hotspot_plan,
-                    &output.reachability_results,
-                )? {
-                    let prompt_input_path =
-                        absolute_artifact_path(&verify_dir.join("prompt-input.json"))?;
-                    let verify_prompt =
-                        prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
-                    persist_pass_artifacts(&verify_dir, &prompt_input, &verify_prompt)?;
-                    Some(provider.verify_candidate(ProviderRequest {
-                        working_dir: &repo_root,
-                        prompt: &verify_prompt,
-                        schema: &verify_schema,
-                        pass_dir: &verify_dir,
-                        candidate_index: candidate.candidate_index,
-                        phase: AnalysisPhase::Verify,
-                        model: args.model.as_deref(),
-                        effort: verify_effort,
-                        verbose,
-                    })?)
+                if !execution_plan.should_rerun(PipelineStage::Verify)
+                    && verify_dir.join("analysis.json").exists()
+                {
+                    Some(load_json_file(&verify_dir.join("analysis.json"))?)
                 } else {
-                    Some(VerificationAnalysis {
-                        verification_summary:
-                            "No reachability-reviewed hypotheses survived into adjudication."
-                                .to_owned(),
-                        verdict: crate::types::VerificationVerdict::Rejected,
-                        confirmed_findings: Vec::new(),
-                    })
+                    if let Some(prompt_input) = build_codex_verify_prompt_input(
+                        &repo_root,
+                        &verify_dir,
+                        candidate,
+                        &output.hotspot_plan,
+                        &output.reachability_results,
+                    )? {
+                        let prompt_input_path =
+                            absolute_artifact_path(&verify_dir.join("prompt-input.json"))?;
+                        let verify_prompt =
+                            prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
+                        persist_pass_artifacts(&verify_dir, &prompt_input, &verify_prompt)?;
+                        Some(provider.verify_candidate(ProviderRequest {
+                            working_dir: &repo_root,
+                            prompt: &verify_prompt,
+                            schema: &verify_schema,
+                            pass_dir: &verify_dir,
+                            candidate_index: candidate.candidate_index,
+                            phase: AnalysisPhase::Verify,
+                            model: args.model.as_deref(),
+                            effort: verify_effort,
+                            verbose,
+                        })?)
+                    } else {
+                        Some(VerificationAnalysis {
+                            verification_summary:
+                                "No reachability-reviewed hypotheses survived into adjudication."
+                                    .to_owned(),
+                            verdict: crate::types::VerificationVerdict::Rejected,
+                            confirmed_findings: Vec::new(),
+                        })
+                    }
                 }
             } else {
                 let verify_prompt = prepare_verify_pass_artifacts(
@@ -452,8 +533,22 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             screening,
             verification,
         };
+        let final_stage_state = if outcome.verification.is_some() {
+            CandidateStageState {
+                highest_completed_stage: PipelineStage::Verify.as_str().to_owned(),
+                pipeline_complete: true,
+            }
+        } else if let Some(stage_state) = codex_screening_state {
+            stage_state
+        } else {
+            CandidateStageState {
+                highest_completed_stage: PipelineStage::Verify.as_str().to_owned(),
+                pipeline_complete: true,
+            }
+        };
         persist_candidate_input(&wip_dir, candidate)?;
         persist_candidate_outcome(&wip_dir, &outcome)?;
+        persist_candidate_stage_state(&wip_dir, &final_stage_state)?;
         let keep_candidate_dir = should_retain_candidate_artifacts();
         finalize_candidate_dir(&wip_dir, &completed_dir, keep_candidate_dir, verbose)?;
         update_candidate_progress(
@@ -496,13 +591,38 @@ fn validate_args(args: &AnalyzeArgs) -> Result<()> {
     if !(0.0..=1.0).contains(&args.min_confidence) {
         bail!("--min-confidence must be between 0.0 and 1.0");
     }
-    if args.stop_after_stage.is_some() && !matches!(args.provider, ProviderKind::Codex) {
-        bail!("--stop-after-stage is currently supported only with --provider codex");
+    if (args.stop_after_stage.is_some()
+        || args.start_at_stage.is_some()
+        || !args.inventory_focuses.is_empty()
+        || !args.rerun_stages.is_empty())
+        && !matches!(args.provider, ProviderKind::Codex)
+    {
+        bail!(
+            "--stop-after-stage, --start-at-stage, --inventory-focuses, and --rerun-stages are currently supported only with --provider codex"
+        );
     }
-    if !args.inventory_focuses.is_empty() && !matches!(args.provider, ProviderKind::Codex) {
-        bail!("--inventory-focuses is currently supported only with --provider codex");
+    if let (Some(start_at_stage), Some(stop_after_stage)) =
+        (args.start_at_stage, args.stop_after_stage)
+        && start_at_stage.order() > stop_after_stage.order()
+    {
+        bail!("--start-at-stage cannot come after --stop-after-stage");
     }
     Ok(())
+}
+
+/// Returns whether two manifests describe the same reusable analysis run.
+fn manifests_match(existing: &RunManifest, current: &RunManifest) -> bool {
+    existing.provider == current.provider
+        && existing.model == current.model
+        && existing.screen_effort == current.screen_effort
+        && existing.verify_effort == current.verify_effort
+        && existing.repo_root == current.repo_root
+        && existing.from == current.from
+        && existing.to == current.to
+        && existing.commit_count == current.commit_count
+        && existing.max_patch_bytes == current.max_patch_bytes
+        && existing.dry_run == current.dry_run
+        && existing.inventory_focuses == current.inventory_focuses
 }
 
 /// Ensures the run manifest either matches the existing run directory or is written freshly.
@@ -515,7 +635,7 @@ fn ensure_manifest(run_dir: &Path, manifest: &RunManifest, verbose: bool) -> Res
         )
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
-        if existing != *manifest {
+        if !manifests_match(&existing, manifest) {
             bail!(
                 "existing run manifest in {} does not match the current command",
                 run_dir.display()
@@ -527,7 +647,8 @@ fn ensure_manifest(run_dir: &Path, manifest: &RunManifest, verbose: bool) -> Res
             "resume",
             format!("found matching manifest in {}", run_dir.display()),
         );
-        return Ok(());
+        return fs::write(&path, serde_json::to_string_pretty(manifest)?)
+            .with_context(|| format!("failed to update {}", path.display()));
     }
 
     fs::write(&path, serde_json::to_string_pretty(manifest)?)
@@ -686,6 +807,31 @@ where
         .with_context(|| format!("failed to write {}", pass_dir.join("prompt.txt").display()))
 }
 
+/// Persists one structured stage-result file in pretty JSON form.
+fn persist_stage_results<T>(path: &Path, results: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    fs::write(path, serde_json::to_string_pretty(results)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Persists one candidate-stage state file.
+fn persist_candidate_stage_state(candidate_dir: &Path, state: &CandidateStageState) -> Result<()> {
+    let path = candidate_stage_state_path(candidate_dir);
+    persist_stage_results(&path, state)
+}
+
+/// Loads one candidate-stage state file when it exists.
+fn load_candidate_stage_state(candidate_dir: &Path) -> Result<Option<CandidateStageState>> {
+    let path = candidate_stage_state_path(candidate_dir);
+    if path.exists() {
+        return load_json_file(&path).map(Some);
+    }
+
+    infer_candidate_stage_state(candidate_dir)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CodexPromptCommit {
     id: String,
@@ -712,6 +858,26 @@ struct CodexInventoryClusterPromptInput {
     commit: CodexPromptCommit,
     hotspot_plan: HotspotPlan,
     cluster: HotspotCluster,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexInventoryFocusResult {
+    cluster: HotspotCluster,
+    analysis: ScreeningAnalysis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexSynthesisGroup {
+    cluster: HotspotCluster,
+    focus_results: Vec<CodexInventoryFocusResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexSynthesisPromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+    synthesis_group: CodexSynthesisGroup,
 }
 
 #[derive(Debug, Serialize)]
@@ -787,11 +953,18 @@ struct CodexInventoryPlanArtifacts {
     clusters: Vec<CodexInventoryClusterArtifacts>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexInventoryHypothesis {
     hypothesis_index: usize,
     cluster: HotspotCluster,
     finding: SuspiciousFinding,
+}
+
+#[derive(Debug, Clone)]
+struct CodexSynthesisArtifacts {
+    group: CodexSynthesisGroup,
+    pass_dir: PathBuf,
+    prompt: String,
 }
 
 #[derive(Debug, Clone)]
@@ -803,7 +976,7 @@ struct CodexInteractionArtifacts {
     prompt: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexInteractionRecord {
     hypothesis_index: usize,
     cluster: HotspotCluster,
@@ -820,7 +993,7 @@ struct CodexReachabilityArtifacts {
     prompt: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexReachabilityRecord {
     hypothesis_index: usize,
     cluster: HotspotCluster,
@@ -828,10 +1001,29 @@ struct CodexReachabilityRecord {
     analysis: ReachabilityAnalysis,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexInventoryMergeOutput {
     analysis: ScreeningAnalysis,
+    focus_results: Vec<CodexInventoryFocusResult>,
     hypotheses: Vec<CodexInventoryHypothesis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexSynthesisMergeOutput {
+    analysis: ScreeningAnalysis,
+    hypotheses: Vec<CodexInventoryHypothesis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexInteractionStageOutput {
+    analysis: ScreeningAnalysis,
+    records: Vec<CodexInteractionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexReachabilityStageOutput {
+    analysis: ScreeningAnalysis,
+    records: Vec<CodexReachabilityRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -839,6 +1031,8 @@ struct CodexScreeningPipelineOutput {
     screening: ScreeningAnalysis,
     hotspot_plan: HotspotPlan,
     reachability_results: Vec<CodexReachabilityRecord>,
+    highest_completed_stage: PipelineStage,
+    pipeline_complete: bool,
 }
 
 /// Prepares one screening-pass prompt and pass artifacts for the selected provider.
@@ -898,6 +1092,11 @@ fn inventory_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("inventory")
 }
 
+/// Returns the synthesis-stage artifact root for one screen pass.
+fn synthesis_stage_dir(screen_dir: &Path) -> PathBuf {
+    screen_dir.join("synthesis")
+}
+
 /// Returns the reachability-stage artifact root for one screen pass.
 fn reachability_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("reachability")
@@ -906,6 +1105,26 @@ fn reachability_stage_dir(screen_dir: &Path) -> PathBuf {
 /// Returns the interaction-stage artifact root for one screen pass.
 fn interaction_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("interaction")
+}
+
+/// Returns the persisted inventory-stage results path.
+fn inventory_results_path(screen_dir: &Path) -> PathBuf {
+    inventory_stage_dir(screen_dir).join("results.json")
+}
+
+/// Returns the persisted synthesis-stage results path.
+fn synthesis_results_path(screen_dir: &Path) -> PathBuf {
+    synthesis_stage_dir(screen_dir).join("results.json")
+}
+
+/// Returns the persisted interaction-stage results path.
+fn interaction_results_path(screen_dir: &Path) -> PathBuf {
+    interaction_stage_dir(screen_dir).join("results.json")
+}
+
+/// Returns the persisted reachability-stage results path.
+fn reachability_results_path(screen_dir: &Path) -> PathBuf {
+    reachability_stage_dir(screen_dir).join("results.json")
 }
 
 /// Builds the inventory focus units used for isolated first-stage Codex runs.
@@ -1026,6 +1245,76 @@ fn prepare_codex_screen_plan_artifacts(
     })
 }
 
+/// Loads persisted inventory-stage output when it exists.
+fn load_inventory_merge_output(screen_dir: &Path) -> Result<Option<CodexInventoryMergeOutput>> {
+    let path = inventory_results_path(screen_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json_file(&path).map(Some)
+}
+
+/// Persists merged inventory-stage output.
+fn persist_inventory_merge_output(
+    screen_dir: &Path,
+    output: &CodexInventoryMergeOutput,
+) -> Result<()> {
+    persist_stage_results(&inventory_results_path(screen_dir), output)
+}
+
+/// Loads persisted synthesis-stage output when it exists.
+fn load_synthesis_merge_output(screen_dir: &Path) -> Result<Option<CodexSynthesisMergeOutput>> {
+    let path = synthesis_results_path(screen_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json_file(&path).map(Some)
+}
+
+/// Persists merged synthesis-stage output.
+fn persist_synthesis_merge_output(
+    screen_dir: &Path,
+    output: &CodexSynthesisMergeOutput,
+) -> Result<()> {
+    persist_stage_results(&synthesis_results_path(screen_dir), output)
+}
+
+/// Loads persisted interaction-stage output when it exists.
+fn load_interaction_stage_output(screen_dir: &Path) -> Result<Option<CodexInteractionStageOutput>> {
+    let path = interaction_results_path(screen_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json_file(&path).map(Some)
+}
+
+/// Persists merged interaction-stage output.
+fn persist_interaction_stage_output(
+    screen_dir: &Path,
+    output: &CodexInteractionStageOutput,
+) -> Result<()> {
+    persist_stage_results(&interaction_results_path(screen_dir), output)
+}
+
+/// Loads persisted reachability-stage output when it exists.
+fn load_reachability_stage_output(
+    screen_dir: &Path,
+) -> Result<Option<CodexReachabilityStageOutput>> {
+    let path = reachability_results_path(screen_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json_file(&path).map(Some)
+}
+
+/// Persists merged reachability-stage output.
+fn persist_reachability_stage_output(
+    screen_dir: &Path,
+    output: &CodexReachabilityStageOutput,
+) -> Result<()> {
+    persist_stage_results(&reachability_results_path(screen_dir), output)
+}
+
 /// Runs the staged Codex screening pipeline for one candidate.
 fn run_codex_screening_pipeline(
     provider: &dyn crate::provider::AgentProvider,
@@ -1035,32 +1324,63 @@ fn run_codex_screening_pipeline(
     artifacts: &CodexInventoryPlanArtifacts,
     run_dir: &Path,
     inventory_schema: &str,
+    synthesis_schema: &str,
     interaction_schema: &str,
     reachability_schema: &str,
     model: Option<&str>,
     effort: Option<crate::cli::ReasoningEffort>,
-    stop_after_stage: Option<PipelineStage>,
+    execution_plan: StageExecutionPlan,
     verbose: bool,
 ) -> Result<CodexScreeningPipelineOutput> {
-    let inventory = run_codex_inventory(
-        provider,
-        artifacts,
-        repo_root,
-        run_dir,
-        inventory_schema,
-        candidate.candidate_index,
-        model,
-        effort,
-        verbose,
-    )?;
+    let inventory = if execution_plan.includes(PipelineStage::Inventory) {
+        if !execution_plan.should_rerun(PipelineStage::Inventory) {
+            if let Some(existing) = load_inventory_merge_output(screen_dir)? {
+                existing
+            } else {
+                run_codex_inventory(
+                    provider,
+                    artifacts,
+                    repo_root,
+                    run_dir,
+                    inventory_schema,
+                    candidate.candidate_index,
+                    model,
+                    effort,
+                    verbose,
+                )?
+            }
+        } else {
+            run_codex_inventory(
+                provider,
+                artifacts,
+                repo_root,
+                run_dir,
+                inventory_schema,
+                candidate.candidate_index,
+                model,
+                effort,
+                verbose,
+            )?
+        }
+    } else if let Some(existing) = load_inventory_merge_output(screen_dir)? {
+        existing
+    } else {
+        bail!(
+            "inventory stage output is required before starting at {}",
+            execution_plan.start_at.as_str()
+        );
+    };
     let inventory_dir = inventory_stage_dir(screen_dir);
     persist_screening_analysis(&inventory_dir, &inventory.analysis)?;
+    persist_inventory_merge_output(screen_dir, &inventory)?;
 
-    if matches!(stop_after_stage, Some(PipelineStage::Inventory)) {
+    if execution_plan.stops_after(PipelineStage::Inventory) {
         return Ok(CodexScreeningPipelineOutput {
             screening: inventory.analysis,
             hotspot_plan: artifacts.hotspot_plan.clone(),
             reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::Inventory,
+            pipeline_complete: false,
         });
     }
 
@@ -1069,6 +1389,83 @@ fn run_codex_screening_pipeline(
             screening: inventory.analysis,
             hotspot_plan: artifacts.hotspot_plan.clone(),
             reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::Inventory,
+            pipeline_complete: true,
+        });
+    }
+
+    update_candidate_progress(
+        run_dir,
+        candidate.candidate_index,
+        Some(ProgressStatus::InProgress),
+        Some("screen synthesis"),
+        None,
+    )?;
+    let synthesis = if execution_plan.includes(PipelineStage::Synthesis) {
+        if !execution_plan.should_rerun(PipelineStage::Synthesis) {
+            if let Some(existing) = load_synthesis_merge_output(screen_dir)? {
+                existing
+            } else {
+                let synthesis_artifacts = prepare_codex_synthesis_artifacts(
+                    repo_root, screen_dir, candidate, artifacts, &inventory,
+                )?;
+                run_codex_synthesis(
+                    provider,
+                    repo_root,
+                    &synthesis_artifacts,
+                    run_dir,
+                    synthesis_schema,
+                    candidate.candidate_index,
+                    model,
+                    effort,
+                    verbose,
+                )?
+            }
+        } else {
+            let synthesis_artifacts = prepare_codex_synthesis_artifacts(
+                repo_root, screen_dir, candidate, artifacts, &inventory,
+            )?;
+            run_codex_synthesis(
+                provider,
+                repo_root,
+                &synthesis_artifacts,
+                run_dir,
+                synthesis_schema,
+                candidate.candidate_index,
+                model,
+                effort,
+                verbose,
+            )?
+        }
+    } else if let Some(existing) = load_synthesis_merge_output(screen_dir)? {
+        existing
+    } else {
+        bail!(
+            "synthesis stage output is required before starting at {}",
+            execution_plan.start_at.as_str()
+        );
+    };
+    let synthesis_dir = synthesis_stage_dir(screen_dir);
+    persist_screening_analysis(&synthesis_dir, &synthesis.analysis)?;
+    persist_synthesis_merge_output(screen_dir, &synthesis)?;
+
+    if execution_plan.stops_after(PipelineStage::Synthesis) {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: synthesis.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::Synthesis,
+            pipeline_complete: false,
+        });
+    }
+
+    if synthesis.hypotheses.is_empty() {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: synthesis.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::Synthesis,
+            pipeline_complete: true,
         });
     }
 
@@ -1079,34 +1476,81 @@ fn run_codex_screening_pipeline(
         Some("screen interaction"),
         None,
     )?;
-    let interaction_artifacts = prepare_codex_interaction_artifacts(
-        repo_root,
-        screen_dir,
-        candidate,
-        artifacts,
-        &inventory.hypotheses,
-    )?;
-    let interaction_results = run_codex_interaction(
-        provider,
-        repo_root,
-        &interaction_artifacts,
-        run_dir,
-        interaction_schema,
-        candidate.candidate_index,
-        model,
-        effort,
-        verbose,
-    )?;
+    let interaction_stage = if execution_plan.includes(PipelineStage::Interaction) {
+        if !execution_plan.should_rerun(PipelineStage::Interaction) {
+            if let Some(existing) = load_interaction_stage_output(screen_dir)? {
+                existing
+            } else {
+                let interaction_artifacts = prepare_codex_interaction_artifacts(
+                    repo_root,
+                    screen_dir,
+                    candidate,
+                    artifacts,
+                    &synthesis.hypotheses,
+                )?;
+                let interaction_results = run_codex_interaction(
+                    provider,
+                    repo_root,
+                    &interaction_artifacts,
+                    run_dir,
+                    interaction_schema,
+                    candidate.candidate_index,
+                    model,
+                    effort,
+                    verbose,
+                )?;
+                let analysis =
+                    merge_codex_interaction_results(artifacts.clusters.len(), &interaction_results);
+                CodexInteractionStageOutput {
+                    analysis,
+                    records: interaction_results,
+                }
+            }
+        } else {
+            let interaction_artifacts = prepare_codex_interaction_artifacts(
+                repo_root,
+                screen_dir,
+                candidate,
+                artifacts,
+                &synthesis.hypotheses,
+            )?;
+            let interaction_results = run_codex_interaction(
+                provider,
+                repo_root,
+                &interaction_artifacts,
+                run_dir,
+                interaction_schema,
+                candidate.candidate_index,
+                model,
+                effort,
+                verbose,
+            )?;
+            let analysis =
+                merge_codex_interaction_results(artifacts.clusters.len(), &interaction_results);
+            CodexInteractionStageOutput {
+                analysis,
+                records: interaction_results,
+            }
+        }
+    } else if let Some(existing) = load_interaction_stage_output(screen_dir)? {
+        existing
+    } else {
+        bail!(
+            "interaction stage output is required before starting at {}",
+            execution_plan.start_at.as_str()
+        );
+    };
     let interaction_dir = interaction_stage_dir(screen_dir);
-    let interaction_screening =
-        merge_codex_interaction_results(artifacts.clusters.len(), &interaction_results);
-    persist_screening_analysis(&interaction_dir, &interaction_screening)?;
+    persist_screening_analysis(&interaction_dir, &interaction_stage.analysis)?;
+    persist_interaction_stage_output(screen_dir, &interaction_stage)?;
 
-    if matches!(stop_after_stage, Some(PipelineStage::Interaction)) {
+    if execution_plan.stops_after(PipelineStage::Interaction) {
         return Ok(CodexScreeningPipelineOutput {
-            screening: interaction_screening,
+            screening: interaction_stage.analysis,
             hotspot_plan: artifacts.hotspot_plan.clone(),
             reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::Interaction,
+            pipeline_complete: false,
         });
     }
 
@@ -1117,33 +1561,93 @@ fn run_codex_screening_pipeline(
         Some("screen reachability"),
         None,
     )?;
-    let reachability_artifacts = prepare_codex_reachability_artifacts(
-        repo_root,
-        screen_dir,
-        candidate,
-        artifacts,
-        &interaction_results,
-    )?;
-    let reachability_results = run_codex_reachability(
-        provider,
-        repo_root,
-        &reachability_artifacts,
-        run_dir,
-        reachability_schema,
-        candidate.candidate_index,
-        model,
-        effort,
-        verbose,
-    )?;
-    let screening =
-        merge_codex_reachability_results(artifacts.clusters.len(), &reachability_results);
+    let reachability_stage = if execution_plan.includes(PipelineStage::Reachability) {
+        if !execution_plan.should_rerun(PipelineStage::Reachability) {
+            if let Some(existing) = load_reachability_stage_output(screen_dir)? {
+                existing
+            } else {
+                let reachability_artifacts = prepare_codex_reachability_artifacts(
+                    repo_root,
+                    screen_dir,
+                    candidate,
+                    artifacts,
+                    &interaction_stage.records,
+                )?;
+                let reachability_results = run_codex_reachability(
+                    provider,
+                    repo_root,
+                    &reachability_artifacts,
+                    run_dir,
+                    reachability_schema,
+                    candidate.candidate_index,
+                    model,
+                    effort,
+                    verbose,
+                )?;
+                let analysis = merge_codex_reachability_results(
+                    artifacts.clusters.len(),
+                    &reachability_results,
+                );
+                CodexReachabilityStageOutput {
+                    analysis,
+                    records: reachability_results,
+                }
+            }
+        } else {
+            let reachability_artifacts = prepare_codex_reachability_artifacts(
+                repo_root,
+                screen_dir,
+                candidate,
+                artifacts,
+                &interaction_stage.records,
+            )?;
+            let reachability_results = run_codex_reachability(
+                provider,
+                repo_root,
+                &reachability_artifacts,
+                run_dir,
+                reachability_schema,
+                candidate.candidate_index,
+                model,
+                effort,
+                verbose,
+            )?;
+            let analysis =
+                merge_codex_reachability_results(artifacts.clusters.len(), &reachability_results);
+            CodexReachabilityStageOutput {
+                analysis,
+                records: reachability_results,
+            }
+        }
+    } else if let Some(existing) = load_reachability_stage_output(screen_dir)? {
+        existing
+    } else {
+        bail!(
+            "reachability stage output is required before starting at {}",
+            execution_plan.start_at.as_str()
+        );
+    };
     let reachability_dir = reachability_stage_dir(screen_dir);
-    persist_screening_analysis(&reachability_dir, &screening)?;
+    persist_screening_analysis(&reachability_dir, &reachability_stage.analysis)?;
+    persist_reachability_stage_output(screen_dir, &reachability_stage)?;
+
+    let pipeline_complete = reachability_stage.analysis.suspicious_findings.is_empty();
+    if execution_plan.stops_after(PipelineStage::Reachability) {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: reachability_stage.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: reachability_stage.records,
+            highest_completed_stage: PipelineStage::Reachability,
+            pipeline_complete,
+        });
+    }
 
     Ok(CodexScreeningPipelineOutput {
-        screening,
+        screening: reachability_stage.analysis,
         hotspot_plan: artifacts.hotspot_plan.clone(),
-        reachability_results,
+        reachability_results: reachability_stage.records,
+        highest_completed_stage: PipelineStage::Reachability,
+        pipeline_complete: false,
     })
 }
 
@@ -1159,7 +1663,7 @@ fn run_codex_inventory(
     effort: Option<crate::cli::ReasoningEffort>,
     verbose: bool,
 ) -> Result<CodexInventoryMergeOutput> {
-    let mut cluster_results = Vec::with_capacity(artifacts.clusters.len());
+    let mut focus_results = Vec::with_capacity(artifacts.clusters.len());
     for cluster_artifact in &artifacts.clusters {
         update_candidate_progress(
             run_dir,
@@ -1191,28 +1695,34 @@ fn run_codex_inventory(
             verbose,
         })?;
         persist_screening_analysis(&cluster_artifact.pass_dir, &analysis)?;
-        cluster_results.push((cluster_artifact.cluster.clone(), analysis));
+        focus_results.push(CodexInventoryFocusResult {
+            cluster: cluster_artifact.cluster.clone(),
+            analysis,
+        });
     }
 
     Ok(merge_codex_inventory_results(
         artifacts.clusters.len(),
-        cluster_results,
+        focus_results,
     ))
 }
 
 /// Merges clustered Codex inventory results into a deduplicated hypothesis list.
 fn merge_codex_inventory_results(
     cluster_count: usize,
-    cluster_results: Vec<(HotspotCluster, ScreeningAnalysis)>,
+    focus_results: Vec<CodexInventoryFocusResult>,
 ) -> CodexInventoryMergeOutput {
     let mut deduped = Vec::new();
     let mut seen = BTreeSet::new();
     let mut positive_clusters = Vec::new();
 
-    for (cluster, analysis) in cluster_results {
+    for focus_result in &focus_results {
+        let cluster = &focus_result.cluster;
+        let analysis = &focus_result.analysis;
         let primary_finding = analysis
             .suspicious_findings
-            .into_iter()
+            .iter()
+            .cloned()
             .max_by(|left, right| {
                 left.confidence
                     .partial_cmp(&right.confidence)
@@ -1270,6 +1780,295 @@ fn merge_codex_inventory_results(
     };
 
     CodexInventoryMergeOutput {
+        analysis: ScreeningAnalysis {
+            candidate_summary,
+            suspicious_findings: deduped
+                .iter()
+                .map(|hypothesis| hypothesis.finding.clone())
+                .collect(),
+        },
+        focus_results,
+        hypotheses: deduped,
+    }
+}
+
+/// Builds grouped synthesis inputs from per-focus inventory results.
+fn build_synthesis_groups(focus_results: &[CodexInventoryFocusResult]) -> Vec<CodexSynthesisGroup> {
+    let mut grouped = std::collections::BTreeMap::<String, Vec<CodexInventoryFocusResult>>::new();
+    for focus_result in focus_results {
+        grouped
+            .entry(focus_result.cluster.category.clone())
+            .or_default()
+            .push(focus_result.clone());
+    }
+
+    let mut groups = grouped
+        .into_iter()
+        .map(|(category, mut entries)| {
+            entries.sort_by_key(|entry| entry.cluster.cluster_index);
+            let files = entries
+                .iter()
+                .flat_map(|entry| entry.cluster.files.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let function_hints = entries
+                .iter()
+                .flat_map(|entry| entry.cluster.function_hints.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>();
+            let signal_terms = entries
+                .iter()
+                .flat_map(|entry| entry.cluster.signal_terms.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let score = entries
+                .iter()
+                .map(|entry| entry.cluster.score)
+                .sum::<usize>();
+            let cluster_index = entries
+                .iter()
+                .map(|entry| entry.cluster.cluster_index)
+                .min()
+                .unwrap_or(0);
+            let cluster = HotspotCluster {
+                cluster_index,
+                title: synthesis_group_title(&category),
+                rationale: synthesis_group_rationale(&category),
+                category,
+                files,
+                function_hints,
+                signal_terms,
+                score,
+            };
+
+            CodexSynthesisGroup {
+                cluster,
+                focus_results: entries,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    groups.sort_by(|left, right| {
+        right
+            .cluster
+            .score
+            .cmp(&left.cluster.score)
+            .then_with(|| left.cluster.cluster_index.cmp(&right.cluster.cluster_index))
+    });
+    groups
+}
+
+/// Returns the human-readable title for one grouped synthesis category.
+fn synthesis_group_title(category: &str) -> String {
+    match category {
+        "digest_length_verify" => "Digest-length verification synthesis".to_owned(),
+        "digest_length_sign" => "Digest-length signing synthesis".to_owned(),
+        "algorithm_binding" => "Algorithm-binding synthesis".to_owned(),
+        "parser_validation" => "Parser-validation synthesis".to_owned(),
+        "guarded_state_change" => "Guarded-state synthesis".to_owned(),
+        _ => format!("Synthesis: {category}"),
+    }
+}
+
+/// Returns the synthesis rationale for one grouped hotspot category.
+fn synthesis_group_rationale(category: &str) -> String {
+    match category {
+        "digest_length_verify" => {
+            "Synthesize whether several digest-length verification changes describe one stronger shared verification bug across wrappers, helpers, and signed-object paths.".to_owned()
+        }
+        "algorithm_binding" => {
+            "Synthesize whether several algorithm-binding checks describe one shared certificate or signed-object verification flaw.".to_owned()
+        }
+        "parser_validation" => {
+            "Synthesize whether parser and verifier guards combine into one trust-boundary bug rather than separate local cleanups.".to_owned()
+        }
+        _ => {
+            "Synthesize the grouped focus units and keep only stronger shared security stories."
+                .to_owned()
+        }
+    }
+}
+
+/// Selects the files and snapshots needed to synthesize one grouped category.
+fn selected_files_for_synthesis_group(group: &CodexSynthesisGroup) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in &group.cluster.files {
+        selected.insert(path.clone());
+    }
+    for focus_result in &group.focus_results {
+        for finding in &focus_result.analysis.suspicious_findings {
+            for path in &finding.affected_files {
+                selected.insert(path.clone());
+            }
+        }
+    }
+    selected.into_iter().collect()
+}
+
+/// Prepares one synthesis-review bundle for each grouped hotspot category.
+fn prepare_codex_synthesis_artifacts(
+    repo_root: &Path,
+    screen_dir: &Path,
+    candidate: &CommitCandidate,
+    artifacts: &CodexInventoryPlanArtifacts,
+    inventory: &CodexInventoryMergeOutput,
+) -> Result<Vec<CodexSynthesisArtifacts>> {
+    let synthesis_dir = synthesis_stage_dir(screen_dir);
+    fs::create_dir_all(&synthesis_dir)
+        .with_context(|| format!("failed to create {}", synthesis_dir.display()))?;
+
+    let groups = build_synthesis_groups(&inventory.focus_results);
+    let mut outputs = Vec::with_capacity(groups.len());
+    for (group_index, group) in groups.iter().enumerate() {
+        let group_dir = synthesis_dir.join(format!("group-{group_index:04}"));
+        fs::create_dir_all(&group_dir)
+            .with_context(|| format!("failed to create {}", group_dir.display()))?;
+        let selected_files = selected_files_for_synthesis_group(group);
+        let filtered_patch = filtered_patch_for_selection(&artifacts.full_patch, &selected_files);
+        let evidence = persist_codex_evidence_bundle(
+            &group_dir,
+            repo_root,
+            candidate,
+            &selected_files,
+            &filtered_patch,
+            &artifacts.hotspot_plan,
+        )?;
+        let prompt_input = CodexSynthesisPromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            synthesis_group: group.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&group_dir.join("prompt-input.json"))?;
+        let prompt = prompt::render_codex_synthesis_prompt(Path::new(&prompt_input_path));
+        persist_pass_artifacts(&group_dir, &prompt_input, &prompt)?;
+        outputs.push(CodexSynthesisArtifacts {
+            group: group.clone(),
+            pass_dir: group_dir,
+            prompt,
+        });
+    }
+
+    Ok(outputs)
+}
+
+/// Runs one synthesis review for each grouped hotspot category.
+fn run_codex_synthesis(
+    provider: &dyn crate::provider::AgentProvider,
+    working_dir: &Path,
+    artifacts: &[CodexSynthesisArtifacts],
+    run_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<CodexSynthesisMergeOutput> {
+    let mut group_results = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        update_candidate_progress(
+            run_dir,
+            candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some(&format!(
+                "screen synthesis category {}",
+                artifact.group.cluster.category
+            )),
+            None,
+        )?;
+        log_step(
+            verbose,
+            "synthesis",
+            format!("synthesizing category {}", artifact.group.cluster.category),
+        );
+        let analysis = provider.screen_candidate(ProviderRequest {
+            working_dir,
+            prompt: &artifact.prompt,
+            schema,
+            pass_dir: &artifact.pass_dir,
+            candidate_index,
+            phase: AnalysisPhase::Screen,
+            model,
+            effort,
+            verbose,
+        })?;
+        persist_screening_analysis(&artifact.pass_dir, &analysis)?;
+        group_results.push((artifact.group.clone(), analysis));
+    }
+
+    Ok(merge_codex_synthesis_results(group_results))
+}
+
+/// Merges category-level synthesis outputs into deduplicated hypotheses.
+fn merge_codex_synthesis_results(
+    group_results: Vec<(CodexSynthesisGroup, ScreeningAnalysis)>,
+) -> CodexSynthesisMergeOutput {
+    let mut deduped = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut positive_groups = Vec::new();
+
+    for (group, analysis) in group_results {
+        let mut findings = analysis.suspicious_findings.clone();
+        if findings.is_empty() {
+            findings = group
+                .focus_results
+                .iter()
+                .flat_map(|focus_result| focus_result.analysis.suspicious_findings.clone())
+                .collect();
+        }
+
+        if findings.is_empty() {
+            continue;
+        }
+
+        positive_groups.push(group.cluster.title.clone());
+        for finding in findings {
+            let key = format!(
+                "{}|{}|{}",
+                finding.commit_id.to_ascii_lowercase(),
+                finding.title.to_ascii_lowercase(),
+                finding
+                    .likely_bug_class
+                    .clone()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+            );
+            if seen.insert(key) {
+                deduped.push(CodexInventoryHypothesis {
+                    hypothesis_index: 0,
+                    cluster: group.cluster.clone(),
+                    finding,
+                });
+            }
+        }
+    }
+
+    deduped.sort_by(|left, right| {
+        right
+            .finding
+            .confidence
+            .partial_cmp(&left.finding.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.finding.title.cmp(&right.finding.title))
+    });
+    for (hypothesis_index, hypothesis) in deduped.iter_mut().enumerate() {
+        hypothesis.hypothesis_index = hypothesis_index;
+    }
+
+    let candidate_summary = if positive_groups.is_empty() {
+        "Synthesized grouped hotspot categories. No stronger shared theory emerged beyond the isolated focus results.".to_owned()
+    } else {
+        format!(
+            "Synthesized grouped hotspot categories. Stronger shared theories came from: {}.",
+            positive_groups.join("; ")
+        )
+    };
+
+    CodexSynthesisMergeOutput {
         analysis: ScreeningAnalysis {
             candidate_summary,
             suspicious_findings: deduped
@@ -2161,6 +2960,28 @@ fn update_candidate_progress(
             },
         );
     } else if pending_status.is_some() || active_stage.is_some() {
+        if progress
+            .pending
+            .iter()
+            .all(|candidate| candidate.candidate_index != candidate_index)
+            && let Some(position) = progress
+                .complete
+                .iter()
+                .position(|candidate| candidate.candidate_index == candidate_index)
+        {
+            let completed = progress.complete.remove(position);
+            progress.pending.push(ProgressPendingCandidate {
+                candidate_index: completed.candidate_index,
+                commit_id: completed.commit_id,
+                short_id: completed.short_id,
+                status: ProgressStatus::Pending,
+                active_stage: None,
+            });
+            progress
+                .pending
+                .sort_by_key(|candidate| candidate.candidate_index);
+        }
+
         let candidate = progress
             .pending
             .iter_mut()
@@ -2235,22 +3056,43 @@ fn progress_state_path(run_dir: &Path) -> PathBuf {
 }
 
 /// Resets and recreates the work-in-progress directory for one candidate.
-fn prepare_wip_candidate_dir(candidate_dir: &Path, verbose: bool) -> Result<()> {
-    if candidate_dir.exists() {
+fn prepare_candidate_work_dir(wip_dir: &Path, completed_dir: &Path, verbose: bool) -> Result<()> {
+    if wip_dir.exists() {
         log_step(
             verbose,
             "wip",
             format!(
-                "removing stale work-in-progress candidate {}",
-                candidate_dir.display()
+                "reusing existing work-in-progress candidate {}",
+                wip_dir.display()
             ),
         );
-        fs::remove_dir_all(candidate_dir)
-            .with_context(|| format!("failed to remove {}", candidate_dir.display()))?;
+        return Ok(());
     }
 
-    fs::create_dir_all(candidate_dir)
-        .with_context(|| format!("failed to create {}", candidate_dir.display()))
+    if completed_dir.exists() {
+        log_step(
+            verbose,
+            "wip",
+            format!(
+                "moving completed candidate back into work-in-progress {} -> {}",
+                completed_dir.display(),
+                wip_dir.display()
+            ),
+        );
+        if let Some(parent) = wip_dir.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        return fs::rename(completed_dir, wip_dir).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                completed_dir.display(),
+                wip_dir.display()
+            )
+        });
+    }
+
+    fs::create_dir_all(wip_dir).with_context(|| format!("failed to create {}", wip_dir.display()))
 }
 
 /// Finalizes one completed candidate, optionally retaining its artifact directory.
@@ -2402,9 +3244,161 @@ fn wip_candidate_dir(run_dir: &Path, candidate_index: usize) -> PathBuf {
         .join(format!("candidate-{candidate_index:04}"))
 }
 
+/// Returns the persisted candidate-stage state path for one candidate.
+fn candidate_stage_state_path(candidate_dir: &Path) -> PathBuf {
+    candidate_dir.join("stage-state.json")
+}
+
 /// Returns the pass-specific artifact directory for one candidate.
 fn pass_dir(candidate_dir: &Path, phase: AnalysisPhase) -> PathBuf {
     candidate_dir.join(phase.as_str())
+}
+
+/// Removes one stage directory and any downstream dependent artifacts before rerun.
+fn clear_stage_artifacts(
+    candidate_dir: &Path,
+    rerun_from: PipelineStage,
+    verbose: bool,
+) -> Result<()> {
+    let screen_dir = pass_dir(candidate_dir, AnalysisPhase::Screen);
+    let verify_dir = pass_dir(candidate_dir, AnalysisPhase::Verify);
+    let stage_dirs = [
+        (PipelineStage::Inventory, inventory_stage_dir(&screen_dir)),
+        (PipelineStage::Synthesis, synthesis_stage_dir(&screen_dir)),
+        (
+            PipelineStage::Interaction,
+            interaction_stage_dir(&screen_dir),
+        ),
+        (
+            PipelineStage::Reachability,
+            reachability_stage_dir(&screen_dir),
+        ),
+    ];
+
+    for (stage, path) in stage_dirs {
+        if stage.order() < rerun_from.order() || !path.exists() {
+            continue;
+        }
+        log_step(
+            verbose,
+            "rerun",
+            format!(
+                "clearing {stage_name} artifacts at {}",
+                path.display(),
+                stage_name = stage.as_str()
+            ),
+        );
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+
+    let screen_analysis = screen_dir.join("analysis.json");
+    if rerun_from.order() <= PipelineStage::Reachability.order() && screen_analysis.exists() {
+        fs::remove_file(&screen_analysis)
+            .with_context(|| format!("failed to remove {}", screen_analysis.display()))?;
+    }
+    if rerun_from.order() <= PipelineStage::Verify.order() && verify_dir.exists() {
+        log_step(
+            verbose,
+            "rerun",
+            format!("clearing verify artifacts at {}", verify_dir.display()),
+        );
+        fs::remove_dir_all(&verify_dir)
+            .with_context(|| format!("failed to remove {}", verify_dir.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Parses one persisted pipeline-stage label.
+fn parse_pipeline_stage(value: &str) -> Result<PipelineStage> {
+    match value {
+        "inventory" => Ok(PipelineStage::Inventory),
+        "synthesis" => Ok(PipelineStage::Synthesis),
+        "interaction" => Ok(PipelineStage::Interaction),
+        "reachability" => Ok(PipelineStage::Reachability),
+        "verify" => Ok(PipelineStage::Verify),
+        _ => bail!("unknown pipeline stage `{value}`"),
+    }
+}
+
+/// Infers candidate stage state from the available artifact tree.
+fn infer_candidate_stage_state(candidate_dir: &Path) -> Result<Option<CandidateStageState>> {
+    let screen_dir = pass_dir(candidate_dir, AnalysisPhase::Screen);
+    let verify_dir = pass_dir(candidate_dir, AnalysisPhase::Verify);
+    if verify_dir.join("analysis.json").exists() {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::Verify.as_str().to_owned(),
+            pipeline_complete: true,
+        }));
+    }
+    if reachability_results_path(&screen_dir).exists()
+        || reachability_stage_dir(&screen_dir)
+            .join("analysis.json")
+            .exists()
+    {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::Reachability.as_str().to_owned(),
+            pipeline_complete: true,
+        }));
+    }
+    if interaction_results_path(&screen_dir).exists()
+        || interaction_stage_dir(&screen_dir)
+            .join("analysis.json")
+            .exists()
+    {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::Interaction.as_str().to_owned(),
+            pipeline_complete: false,
+        }));
+    }
+    if synthesis_results_path(&screen_dir).exists()
+        || synthesis_stage_dir(&screen_dir)
+            .join("analysis.json")
+            .exists()
+    {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::Synthesis.as_str().to_owned(),
+            pipeline_complete: false,
+        }));
+    }
+    if inventory_results_path(&screen_dir).exists()
+        || inventory_stage_dir(&screen_dir)
+            .join("analysis.json")
+            .exists()
+    {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::Inventory.as_str().to_owned(),
+            pipeline_complete: false,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Returns whether an existing candidate already satisfies the requested staged execution.
+fn candidate_request_satisfied(
+    candidate_dir: &Path,
+    execution_plan: StageExecutionPlan,
+) -> Result<bool> {
+    let Some(state) = load_candidate_stage_state(candidate_dir)? else {
+        return Ok(false);
+    };
+    let highest_completed_stage = parse_pipeline_stage(&state.highest_completed_stage)?;
+
+    if execution_plan
+        .rerun_from
+        .map(|rerun_from| rerun_from.order() <= highest_completed_stage.order())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    if state.pipeline_complete {
+        return Ok(true);
+    }
+
+    Ok(highest_completed_stage.order() >= execution_plan.stop_after.order())
 }
 
 /// Prints one verbose log line.
@@ -2544,9 +3538,9 @@ mod tests {
     use super::{
         CodexReachabilityRecord, absolute_artifact_path, bundle_snapshot_path, ensure_manifest,
         initialize_progress_state, load_progress_state, load_saved_candidate_outcome,
-        merge_codex_inventory_results, persist_candidate_outcome, select_adjudication_finalists,
-        select_inventory_focuses, should_keep_reachability_result, should_review_reachability,
-        validate_args,
+        manifests_match, merge_codex_inventory_results, persist_candidate_outcome,
+        select_adjudication_finalists, select_inventory_focuses, should_keep_reachability_result,
+        should_review_reachability, validate_args,
     };
     use crate::cli::{AnalyzeArgs, PipelineStage, ProviderKind};
     use crate::hotspot::HotspotCluster;
@@ -2578,7 +3572,9 @@ mod tests {
             verbose: false,
             dry_run: true,
             stop_after_stage: None,
+            start_at_stage: None,
             inventory_focuses: Vec::new(),
+            rerun_stages: Vec::new(),
         };
         assert!(validate_args(&args).is_err());
     }
@@ -2601,7 +3597,9 @@ mod tests {
             verbose: false,
             dry_run: true,
             stop_after_stage: Some(PipelineStage::Inventory),
+            start_at_stage: None,
             inventory_focuses: Vec::new(),
+            rerun_stages: Vec::new(),
         };
 
         assert!(validate_args(&args).is_err());
@@ -2625,7 +3623,35 @@ mod tests {
             verbose: false,
             dry_run: true,
             stop_after_stage: None,
+            start_at_stage: None,
             inventory_focuses: vec![1, 4],
+            rerun_stages: Vec::new(),
+        };
+
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn rejects_start_after_stop_stage() {
+        let args = AnalyzeArgs {
+            repo: PathBuf::from("."),
+            from: "a".into(),
+            to: "b".into(),
+            provider: ProviderKind::Codex,
+            model: None,
+            effort: None,
+            screen_effort: None,
+            verify_effort: None,
+            max_commits: None,
+            max_patch_bytes: 100,
+            min_confidence: 0.5,
+            out: PathBuf::from("out"),
+            verbose: false,
+            dry_run: true,
+            stop_after_stage: Some(PipelineStage::Interaction),
+            start_at_stage: Some(PipelineStage::Reachability),
+            inventory_focuses: Vec::new(),
+            rerun_stages: Vec::new(),
         };
 
         assert!(validate_args(&args).is_err());
@@ -2641,6 +3667,21 @@ mod tests {
         assert!(ensure_manifest(&dir, &mismatched, false).is_err());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manifest_matching_ignores_execution_controls() {
+        let mut existing = sample_manifest("codex");
+        existing.stop_after_stage = Some("inventory".into());
+        existing.start_at_stage = Some("inventory".into());
+        existing.rerun_stages = vec!["inventory".into()];
+
+        let mut current = sample_manifest("codex");
+        current.stop_after_stage = Some("verify".into());
+        current.start_at_stage = Some("interaction".into());
+        current.rerun_stages = vec!["interaction".into()];
+
+        assert!(manifests_match(&existing, &current));
     }
 
     #[test]
@@ -2892,16 +3933,16 @@ mod tests {
         let cluster = sample_cluster("digest_length_verify");
         let merged = merge_codex_inventory_results(
             1,
-            vec![(
+            vec![super::CodexInventoryFocusResult {
                 cluster,
-                ScreeningAnalysis {
+                analysis: ScreeningAnalysis {
                     candidate_summary: "summary".into(),
                     suspicious_findings: vec![
                         sample_finding("lower confidence", 0.61, "src/a.rs"),
                         sample_finding("higher confidence", 0.88, "src/a.rs"),
                     ],
                 },
-            )],
+            }],
         );
 
         assert_eq!(merged.hypotheses.len(), 1);
@@ -2950,7 +3991,9 @@ mod tests {
             max_patch_bytes: 100,
             dry_run: false,
             stop_after_stage: None,
+            start_at_stage: None,
             inventory_focuses: Vec::new(),
+            rerun_stages: Vec::new(),
         }
     }
 

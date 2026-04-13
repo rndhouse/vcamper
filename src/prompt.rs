@@ -10,6 +10,7 @@ use crate::hotspot::HotspotCluster;
 use crate::types::{CommitCandidate, FileStat, ScreeningAnalysis};
 
 const SCREEN_COMMIT_TEMPLATE: &str = include_str!("../prompts/analyze_commit.md");
+const SYNTHESIS_TEMPLATE: &str = include_str!("../prompts/synthesis_commit.md");
 const INTERACTION_TEMPLATE: &str = include_str!("../prompts/interaction_commit.md");
 const REACHABILITY_TEMPLATE: &str = include_str!("../prompts/reachability_commit.md");
 const VERIFY_COMMIT_TEMPLATE: &str = include_str!("../prompts/verify_commit.md");
@@ -150,6 +151,25 @@ pub(crate) fn render_codex_screen_cluster_prompt(
     )
 }
 
+/// Renders the Codex-specific synthesis prompt for one grouped category review.
+pub(crate) fn render_codex_synthesis_prompt(prompt_input_path: &Path) -> String {
+    format!(
+        "{SYNTHESIS_TEMPLATE}\n\n\
+         All evidence for this synthesis review is available in the bundle referenced by\n\
+         `{prompt_input_path}`.\n\
+         Start with that `prompt-input.json` file.\n\
+         Inspect the absolute file paths it provides for the grouped patch subset,\n\
+         hotspot plan, and before/after snapshots.\n\
+         Use the per-focus inventory summaries as inputs, not as final conclusions.\n\
+         Your job is to decide whether several related focus units describe one stronger shared\n\
+         security story.\n\
+         Return a JSON object that matches the supplied schema.\n\
+         Use an empty suspicious_findings array when the grouped category does not support a\n\
+         stronger synthesized theory.\n",
+        prompt_input_path = prompt_input_path.display(),
+    )
+}
+
 /// Renders the Codex-specific reachability prompt for one screened hypothesis.
 pub(crate) fn render_codex_interaction_prompt(prompt_input_path: &Path) -> String {
     format!(
@@ -248,8 +268,8 @@ mod tests {
     use super::{
         build_prompt_input, build_verification_prompt_input, render_codex_interaction_prompt,
         render_codex_reachability_prompt, render_codex_screen_cluster_prompt,
-        render_codex_screen_plan_prompt, render_codex_verify_prompt, render_screen_prompt,
-        render_verify_prompt,
+        render_codex_screen_plan_prompt, render_codex_synthesis_prompt, render_codex_verify_prompt,
+        render_screen_prompt, render_verify_prompt,
     };
     use crate::hotspot::HotspotCluster;
     use crate::types::{CommitCandidate, CommitRecord, FileStat, ScreeningAnalysis};
@@ -356,6 +376,16 @@ mod tests {
         assert!(prompt.contains("interaction review as prior context"));
         assert!(prompt.contains("assessment=interaction_dependent"));
         assert!(prompt.contains("refined_finding: null"));
+    }
+
+    #[test]
+    fn codex_synthesis_prompt_points_to_bundle_files() {
+        let prompt = render_codex_synthesis_prompt(Path::new("/tmp/synthesis/prompt-input.json"));
+
+        assert!(prompt.contains("/tmp/synthesis/prompt-input.json"));
+        assert!(prompt.contains("synthesis review"));
+        assert!(prompt.contains("shared"));
+        assert!(prompt.contains("synthesized theory"));
     }
 
     #[test]

@@ -298,10 +298,26 @@ pub(crate) struct RunManifest {
     /// Whether provider execution was skipped.
     pub(crate) dry_run: bool,
     /// Optional staged stop boundary for partial runs.
+    #[serde(default)]
     pub(crate) stop_after_stage: Option<String>,
+    /// Optional staged start boundary for partial runs.
+    #[serde(default)]
+    pub(crate) start_at_stage: Option<String>,
     /// Optional shortlist of hotspot focus indexes selected for Codex inventory.
     #[serde(default)]
     pub(crate) inventory_focuses: Vec<usize>,
+    /// Optional stage list forced to rerun for the current invocation.
+    #[serde(default)]
+    pub(crate) rerun_stages: Vec<String>,
+}
+
+/// Persisted stage-completion metadata for one candidate directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CandidateStageState {
+    /// Highest staged boundary completed for the current candidate artifacts.
+    pub(crate) highest_completed_stage: String,
+    /// Whether the candidate has reached a terminal pipeline state.
+    pub(crate) pipeline_complete: bool,
 }
 
 /// Persisted progress state for one analysis run.
