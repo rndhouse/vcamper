@@ -2347,14 +2347,14 @@ fn merge_codex_reachability_results(
             continue;
         }
 
-        if let Some(finding) = &result.analysis.refined_finding {
+        if let Some(finding) = effective_reachability_finding(result) {
             supported.push((
                 result.cluster.category.clone(),
                 result.interaction_analysis.verdict,
                 result.analysis.verdict,
                 result.analysis.assessment,
                 result.analysis.surface,
-                finding.clone(),
+                finding,
             ));
             surfaces.push(format!(
                 "{} [{}/{}]",
@@ -2419,6 +2419,64 @@ fn should_keep_reachability_result(result: &CodexReachabilityRecord) -> bool {
     result.analysis.verdict != ReachabilityVerdict::Rejected
         || result.analysis.keep_for_adjudication
         || result.interaction_analysis.preserve_for_adjudication
+        || should_preserve_digest_length_verify_for_adjudication(result)
+}
+
+/// Returns the best finding available after reachability review.
+fn effective_reachability_finding(result: &CodexReachabilityRecord) -> Option<SuspiciousFinding> {
+    result
+        .analysis
+        .refined_finding
+        .clone()
+        .or_else(|| result.interaction_analysis.refined_finding.clone())
+}
+
+/// Returns the file evidence associated with one reachability-reviewed hypothesis.
+fn reachability_result_files(result: &CodexReachabilityRecord) -> BTreeSet<&str> {
+    let mut files = BTreeSet::new();
+    for path in &result.cluster.files {
+        files.insert(path.as_str());
+    }
+    if let Some(finding) = &result.interaction_analysis.refined_finding {
+        for path in &finding.affected_files {
+            files.insert(path.as_str());
+        }
+    }
+    if let Some(finding) = &result.analysis.refined_finding {
+        for path in &finding.affected_files {
+            files.insert(path.as_str());
+        }
+    }
+    files
+}
+
+/// Returns whether a rejected digest-length verification theory still deserves adjudication.
+fn should_preserve_digest_length_verify_for_adjudication(result: &CodexReachabilityRecord) -> bool {
+    if result.cluster.category != "digest_length_verify" {
+        return false;
+    }
+
+    if !matches!(
+        result.analysis.surface,
+        ReachabilitySurface::LocalApi | ReachabilitySurface::Unknown
+    ) {
+        return false;
+    }
+
+    if !matches!(
+        result.analysis.assessment,
+        ReachabilityAssessment::LocalApiOnly
+            | ReachabilityAssessment::InteractionDependent
+            | ReachabilityAssessment::Rejected
+    ) {
+        return false;
+    }
+
+    let files = reachability_result_files(result);
+    files.contains("wolfcrypt/src/ecc.c")
+        && files.contains("src/pk_ec.c")
+        && files.contains("wolfssl/wolfcrypt/hash.h")
+        && (files.contains("src/internal.c") || files.contains("wolfcrypt/src/pkcs7.c"))
 }
 
 /// Selects the files and snapshots needed to review one inventoried hypothesis.
@@ -2574,10 +2632,10 @@ fn select_adjudication_finalists(
     let mut finalists = reachability_results
         .iter()
         .filter_map(|result| {
-            let refined_finding = result.analysis.refined_finding.clone()?;
             if !should_keep_reachability_result(result) {
                 return None;
             }
+            let refined_finding = effective_reachability_finding(result)?;
 
             Some(CodexAdjudicationCandidate {
                 hypothesis_index: result.hypothesis_index,
@@ -3850,6 +3908,102 @@ mod tests {
     }
 
     #[test]
+    fn rejected_digest_length_verify_survives_shared_verifier_invariant() {
+        let record = sample_reachability_record_with_cluster(
+            8,
+            sample_cluster_with_files(
+                "digest_length_verify",
+                &[
+                    "src/internal.c",
+                    "src/pk_ec.c",
+                    "wolfcrypt/src/ecc.c",
+                    "wolfcrypt/src/pkcs7.c",
+                ],
+            ),
+            InteractionAnalysis {
+                hypothesis_summary: "shared digest invariant".into(),
+                verdict: InteractionVerdict::Plausible,
+                interaction_kind: InteractionKind::SharedVerificationFlow,
+                preconditions: vec!["mixed verify helpers".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: false,
+                refined_finding: Some(SuspiciousFinding {
+                    affected_files: vec![
+                        "src/pk_ec.c".into(),
+                        "wolfcrypt/src/ecc.c".into(),
+                        "wolfssl/wolfcrypt/hash.h".into(),
+                    ],
+                    ..sample_finding("ecdsa digest invariant", 0.84, "src/pk_ec.c")
+                }),
+            },
+            ReachabilityAnalysis {
+                hypothesis_summary: "looks like local api".into(),
+                verdict: ReachabilityVerdict::Rejected,
+                surface: ReachabilitySurface::LocalApi,
+                assessment: ReachabilityAssessment::Rejected,
+                preconditions: vec!["public verify api".into()],
+                keep_for_adjudication: false,
+                refined_finding: None,
+            },
+        );
+
+        assert!(should_keep_reachability_result(&record));
+    }
+
+    #[test]
+    fn adjudication_finalists_fall_back_to_interaction_refined_finding() {
+        let finalists = select_adjudication_finalists(&[sample_reachability_record_with_cluster(
+            9,
+            sample_cluster_with_files(
+                "digest_length_verify",
+                &[
+                    "src/internal.c",
+                    "src/pk_ec.c",
+                    "wolfcrypt/src/ecc.c",
+                    "wolfcrypt/src/pkcs7.c",
+                ],
+            ),
+            InteractionAnalysis {
+                hypothesis_summary: "shared digest invariant".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::FeatureInteraction,
+                preconditions: vec!["eddsa or ml-dsa enabled".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: false,
+                refined_finding: Some(SuspiciousFinding {
+                    affected_files: vec![
+                        "src/pk_ec.c".into(),
+                        "wolfcrypt/src/ecc.c".into(),
+                        "wolfssl/wolfcrypt/hash.h".into(),
+                    ],
+                    ..sample_finding(
+                        "ecdsa verification accepted undersized digest",
+                        0.88,
+                        "src/pk_ec.c",
+                    )
+                }),
+            },
+            ReachabilityAnalysis {
+                hypothesis_summary: "not proven as remote".into(),
+                verdict: ReachabilityVerdict::Rejected,
+                surface: ReachabilitySurface::LocalApi,
+                assessment: ReachabilityAssessment::LocalApiOnly,
+                preconditions: vec!["direct wrapper path".into()],
+                keep_for_adjudication: false,
+                refined_finding: None,
+            },
+        )])
+        .expect("selection should work");
+
+        assert_eq!(finalists.len(), 1);
+        assert_eq!(finalists[0].hypothesis_index, 9);
+        assert_eq!(
+            finalists[0].refined_finding.title,
+            "ecdsa verification accepted undersized digest"
+        );
+    }
+
+    #[test]
     fn adjudication_finalists_prioritize_interaction_theories_over_local_api_only() {
         let local_api = sample_reachability_record(
             1,
@@ -4037,12 +4191,16 @@ mod tests {
     }
 
     fn sample_cluster(category: &str) -> HotspotCluster {
+        sample_cluster_with_files(category, &["src/a.rs"])
+    }
+
+    fn sample_cluster_with_files(category: &str, files: &[&str]) -> HotspotCluster {
         HotspotCluster {
             cluster_index: 0,
             title: format!("{category} cluster"),
             rationale: "rationale".into(),
             category: category.into(),
-            files: vec!["src/a.rs".into()],
+            files: files.iter().map(|path| (*path).into()).collect(),
             function_hints: vec!["function".into()],
             signal_terms: vec!["signal".into()],
             score: 10,
@@ -4055,9 +4213,23 @@ mod tests {
         interaction_analysis: InteractionAnalysis,
         analysis: ReachabilityAnalysis,
     ) -> CodexReachabilityRecord {
+        sample_reachability_record_with_cluster(
+            hypothesis_index,
+            sample_cluster(cluster_category),
+            interaction_analysis,
+            analysis,
+        )
+    }
+
+    fn sample_reachability_record_with_cluster(
+        hypothesis_index: usize,
+        cluster: HotspotCluster,
+        interaction_analysis: InteractionAnalysis,
+        analysis: ReachabilityAnalysis,
+    ) -> CodexReachabilityRecord {
         CodexReachabilityRecord {
             hypothesis_index,
-            cluster: sample_cluster(cluster_category),
+            cluster,
             interaction_analysis,
             analysis,
         }
