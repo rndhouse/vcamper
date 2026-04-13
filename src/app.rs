@@ -25,10 +25,8 @@ use crate::types::{
     InteractionKind, InteractionVerdict, ProgressCompleteCandidate, ProgressPendingCandidate,
     ProgressResult, ProgressState, ProgressStatus, ReachabilityAnalysis, ReachabilityAssessment,
     ReachabilitySurface, ReachabilityVerdict, RunManifest, ScreeningAnalysis, SuspiciousFinding,
-    VerificationAnalysis,
+    VerificationAnalysis, VerificationVerdict,
 };
-
-const MAX_ADJUDICATION_INPUT_BYTES: usize = 28_000;
 
 #[derive(Debug, Clone, Copy)]
 struct StageExecutionPlan {
@@ -434,7 +432,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 &run_dir,
                 candidate.candidate_index,
                 Some(ProgressStatus::InProgress),
-                Some("verify adjudication"),
+                Some("verify finalist review"),
                 None,
             )?;
             log_step(
@@ -454,35 +452,33 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 {
                     Some(load_json_file(&verify_dir.join("analysis.json"))?)
                 } else {
-                    if let Some(prompt_input) = build_codex_verify_prompt_input(
+                    if let Some(artifacts) = prepare_codex_verify_artifacts(
                         &repo_root,
                         &verify_dir,
                         candidate,
                         &output.hotspot_plan,
                         &output.reachability_results,
                     )? {
-                        let prompt_input_path =
-                            absolute_artifact_path(&verify_dir.join("prompt-input.json"))?;
-                        let verify_prompt =
-                            prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
-                        persist_pass_artifacts(&verify_dir, &prompt_input, &verify_prompt)?;
-                        Some(provider.verify_candidate(ProviderRequest {
-                            working_dir: &repo_root,
-                            prompt: &verify_prompt,
-                            schema: &verify_schema,
-                            pass_dir: &verify_dir,
-                            candidate_index: candidate.candidate_index,
-                            phase: AnalysisPhase::Verify,
-                            model: args.model.as_deref(),
-                            effort: verify_effort,
+                        let records = run_codex_verification(
+                            provider.as_ref(),
+                            &repo_root,
+                            &artifacts,
+                            &run_dir,
+                            &verify_schema,
+                            candidate.candidate_index,
+                            args.model.as_deref(),
+                            verify_effort,
+                            execution_plan.should_rerun(PipelineStage::Verify),
                             verbose,
-                        })?)
+                        )?;
+                        persist_verify_stage_output(&verify_dir, &records)?;
+                        Some(merge_codex_verification_results(&records))
                     } else {
                         Some(VerificationAnalysis {
                             verification_summary:
-                                "No reachability-reviewed hypotheses survived into adjudication."
+                                "No reachability-reviewed hypotheses survived into finalist verification."
                                     .to_owned(),
-                            verdict: crate::types::VerificationVerdict::Rejected,
+                            verdict: VerificationVerdict::Rejected,
                             confirmed_findings: Vec::new(),
                         })
                     }
@@ -810,7 +806,7 @@ where
 /// Persists one structured stage-result file in pretty JSON form.
 fn persist_stage_results<T>(path: &Path, results: &T) -> Result<()>
 where
-    T: Serialize,
+    T: Serialize + ?Sized,
 {
     fs::write(path, serde_json::to_string_pretty(results)?)
         .with_context(|| format!("failed to write {}", path.display()))
@@ -899,7 +895,7 @@ struct CodexReachabilityPromptInput {
     interaction_review: InteractionAnalysis,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexAdjudicationCandidate {
     hypothesis_index: usize,
     cluster_title: String,
@@ -921,7 +917,22 @@ struct CodexVerifyPromptInput {
     commit: CodexPromptCommit,
     commit_message: String,
     hotspot_plan: HotspotPlan,
-    finalists: Vec<CodexAdjudicationCandidate>,
+    finalist: CodexAdjudicationCandidate,
+}
+
+#[derive(Debug, Clone)]
+struct CodexVerifyArtifacts {
+    hypothesis_index: usize,
+    finalist: CodexAdjudicationCandidate,
+    pass_dir: PathBuf,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexVerificationRecord {
+    hypothesis_index: usize,
+    finalist: CodexAdjudicationCandidate,
+    analysis: VerificationAnalysis,
 }
 
 #[derive(Debug, Serialize)]
@@ -1127,6 +1138,11 @@ fn reachability_results_path(screen_dir: &Path) -> PathBuf {
     reachability_stage_dir(screen_dir).join("results.json")
 }
 
+/// Returns the persisted independent verification-stage results path.
+fn verify_results_path(verify_dir: &Path) -> PathBuf {
+    verify_dir.join("results.json")
+}
+
 /// Builds the inventory focus units used for isolated first-stage Codex runs.
 fn build_inventory_focuses(hotspot_plan: &HotspotPlan) -> Vec<HotspotCluster> {
     if hotspot_plan.files.is_empty() {
@@ -1313,6 +1329,14 @@ fn persist_reachability_stage_output(
     output: &CodexReachabilityStageOutput,
 ) -> Result<()> {
     persist_stage_results(&reachability_results_path(screen_dir), output)
+}
+
+/// Persists the independent per-hypothesis verification results.
+fn persist_verify_stage_output(
+    verify_dir: &Path,
+    results: &[CodexVerificationRecord],
+) -> Result<()> {
+    persist_stage_results(&verify_results_path(verify_dir), results)
 }
 
 /// Runs the staged Codex screening pipeline for one candidate.
@@ -2567,69 +2591,11 @@ fn interaction_kind_label(kind: InteractionKind) -> &'static str {
     }
 }
 
-/// Returns whether a finalist represents an interaction-heavy security theory.
-fn is_interaction_priority_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
-    finalist.reachability_assessment == ReachabilityAssessment::InteractionDependent
-        || finalist.interaction_verdict != InteractionVerdict::Absent
-            && finalist.interaction_kind != InteractionKind::None
-}
-
-/// Returns whether a finalist keeps a non-local attacker surface.
-fn is_network_priority_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
-    matches!(
-        finalist.surface,
-        ReachabilitySurface::Remote | ReachabilitySurface::Adjacent
-    )
-}
-
-/// Returns whether a finalist primarily describes local API misuse or contract hardening.
-fn is_local_api_only_finalist(finalist: &CodexAdjudicationCandidate) -> bool {
-    finalist.reachability_assessment == ReachabilityAssessment::LocalApiOnly
-        || finalist.surface == ReachabilitySurface::LocalApi
-}
-
-/// Returns the coarse adjudication priority bucket for one finalist.
-fn adjudication_track_priority(finalist: &CodexAdjudicationCandidate) -> usize {
-    if is_network_priority_finalist(finalist) {
-        4
-    } else if is_interaction_priority_finalist(finalist) {
-        3
-    } else if finalist.surface == ReachabilitySurface::Unknown {
-        2
-    } else if is_local_api_only_finalist(finalist) {
-        1
-    } else {
-        0
-    }
-}
-
-/// Appends one finalist when it fits the current adjudication byte budget.
-fn try_select_finalist(
-    selected: &mut Vec<CodexAdjudicationCandidate>,
-    selected_indexes: &mut BTreeSet<usize>,
-    total_bytes: &mut usize,
-    finalist: &CodexAdjudicationCandidate,
-) -> Result<bool> {
-    if selected_indexes.contains(&finalist.hypothesis_index) {
-        return Ok(false);
-    }
-
-    let bytes = serde_json::to_vec(finalist)?.len();
-    if !selected.is_empty() && *total_bytes + bytes > MAX_ADJUDICATION_INPUT_BYTES {
-        return Ok(false);
-    }
-
-    *total_bytes += bytes;
-    selected_indexes.insert(finalist.hypothesis_index);
-    selected.push(finalist.clone());
-    Ok(true)
-}
-
-/// Shortlists adjudication finalists under a serialized byte budget.
-fn select_adjudication_finalists(
+/// Selects the reachability survivors that should enter independent verification.
+fn select_verification_candidates(
     reachability_results: &[CodexReachabilityRecord],
 ) -> Result<Vec<CodexAdjudicationCandidate>> {
-    let mut finalists = reachability_results
+    Ok(reachability_results
         .iter()
         .filter_map(|result| {
             if !should_keep_reachability_result(result) {
@@ -2658,119 +2624,196 @@ fn select_adjudication_finalists(
                 refined_finding,
             })
         })
-        .collect::<Vec<_>>();
-
-    finalists.sort_by(|left, right| {
-        adjudication_track_priority(right)
-            .cmp(&adjudication_track_priority(left))
-            .then_with(|| {
-                interaction_verdict_priority(right.interaction_verdict)
-                    .cmp(&interaction_verdict_priority(left.interaction_verdict))
-            })
-            .then_with(|| {
-                reachability_assessment_priority(right.reachability_assessment).cmp(
-                    &reachability_assessment_priority(left.reachability_assessment),
-                )
-            })
-            .then_with(|| {
-                reachability_verdict_priority(right.reachability_verdict)
-                    .cmp(&reachability_verdict_priority(left.reachability_verdict))
-            })
-            .then_with(|| {
-                reachability_surface_priority(right.surface)
-                    .cmp(&reachability_surface_priority(left.surface))
-            })
-            .then_with(|| {
-                right
-                    .refined_finding
-                    .confidence
-                    .partial_cmp(&left.refined_finding.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
-    let mut selected = Vec::new();
-    let mut selected_indexes = BTreeSet::new();
-    let mut total_bytes = 0usize;
-
-    for predicate in [
-        is_interaction_priority_finalist as fn(&CodexAdjudicationCandidate) -> bool,
-        is_network_priority_finalist,
-        |finalist: &CodexAdjudicationCandidate| !is_local_api_only_finalist(finalist),
-    ] {
-        if let Some(finalist) = finalists.iter().find(|candidate| predicate(candidate)) {
-            try_select_finalist(
-                &mut selected,
-                &mut selected_indexes,
-                &mut total_bytes,
-                finalist,
-            )?;
-        }
-    }
-
-    let mut category_best = Vec::<CodexAdjudicationCandidate>::new();
-    for finalist in finalists.iter().cloned() {
-        if category_best
-            .iter()
-            .any(|existing| existing.cluster_category == finalist.cluster_category)
-        {
-            continue;
-        }
-        category_best.push(finalist);
-    }
-    for finalist in &category_best {
-        try_select_finalist(
-            &mut selected,
-            &mut selected_indexes,
-            &mut total_bytes,
-            finalist,
-        )?;
-    }
-
-    for finalist in finalists {
-        if !try_select_finalist(
-            &mut selected,
-            &mut selected_indexes,
-            &mut total_bytes,
-            &finalist,
-        )? && total_bytes >= MAX_ADJUDICATION_INPUT_BYTES
-        {
-            break;
-        }
-    }
-
-    Ok(selected)
+        .collect::<Vec<_>>())
 }
 
-/// Builds the Codex adjudication-pass prompt input after shortlisting finalists by budget.
-fn build_codex_verify_prompt_input(
+/// Selects the files and snapshots needed to verify one reachability survivor.
+fn selected_files_for_verification_result(result: &CodexReachabilityRecord) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in &result.cluster.files {
+        selected.insert(path.clone());
+    }
+    if let Some(finding) = effective_reachability_finding(result) {
+        for path in finding.affected_files {
+            selected.insert(path);
+        }
+    }
+    selected.into_iter().collect()
+}
+
+/// Prepares one independent verification bundle for each reachability survivor.
+fn prepare_codex_verify_artifacts(
     repo_root: &Path,
-    pass_dir: &Path,
+    verify_dir: &Path,
     candidate: &CommitCandidate,
     hotspot_plan: &HotspotPlan,
     reachability_results: &[CodexReachabilityRecord],
-) -> Result<Option<CodexVerifyPromptInput>> {
-    let finalists = select_adjudication_finalists(reachability_results)?;
+) -> Result<Option<Vec<CodexVerifyArtifacts>>> {
+    let finalists = select_verification_candidates(reachability_results)?;
     if finalists.is_empty() {
         return Ok(None);
     }
 
     let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
-    let evidence = persist_codex_evidence_bundle(
-        pass_dir,
-        repo_root,
-        candidate,
-        &candidate.commit.files_changed,
-        &full_patch,
-        hotspot_plan,
-    )?;
-    Ok(Some(CodexVerifyPromptInput {
-        candidate_index: candidate.candidate_index,
-        commit: build_codex_prompt_commit(candidate, evidence),
-        commit_message: candidate.commit.summary.clone(),
-        hotspot_plan: hotspot_plan.clone(),
-        finalists,
-    }))
+    let mut artifacts = Vec::with_capacity(finalists.len());
+
+    for finalist in finalists {
+        let Some(result) = reachability_results
+            .iter()
+            .find(|result| result.hypothesis_index == finalist.hypothesis_index)
+        else {
+            bail!(
+                "missing reachability result for verification finalist {}",
+                finalist.hypothesis_index
+            );
+        };
+        let hypothesis_dir =
+            verify_dir.join(format!("hypothesis-{:04}", finalist.hypothesis_index));
+        fs::create_dir_all(&hypothesis_dir)
+            .with_context(|| format!("failed to create {}", hypothesis_dir.display()))?;
+        let selected_files = selected_files_for_verification_result(result);
+        let filtered_patch = filtered_patch_for_selection(&full_patch, &selected_files);
+        let evidence = persist_codex_evidence_bundle(
+            &hypothesis_dir,
+            repo_root,
+            candidate,
+            &selected_files,
+            &filtered_patch,
+            hotspot_plan,
+        )?;
+        let prompt_input = CodexVerifyPromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            commit_message: candidate.commit.summary.clone(),
+            hotspot_plan: hotspot_plan.clone(),
+            finalist: finalist.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&hypothesis_dir.join("prompt-input.json"))?;
+        let prompt = prompt::render_codex_verify_prompt(Path::new(&prompt_input_path));
+        persist_pass_artifacts(&hypothesis_dir, &prompt_input, &prompt)?;
+        artifacts.push(CodexVerifyArtifacts {
+            hypothesis_index: finalist.hypothesis_index,
+            finalist,
+            pass_dir: hypothesis_dir,
+            prompt,
+        });
+    }
+
+    Ok(Some(artifacts))
+}
+
+/// Runs one independent verification pass for each verification finalist.
+fn run_codex_verification(
+    provider: &dyn crate::provider::AgentProvider,
+    working_dir: &Path,
+    artifacts: &[CodexVerifyArtifacts],
+    run_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    rerun_stage: bool,
+    verbose: bool,
+) -> Result<Vec<CodexVerificationRecord>> {
+    let mut results = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let analysis_path = artifact.pass_dir.join("analysis.json");
+        let analysis = if !rerun_stage && analysis_path.exists() {
+            load_json_file(&analysis_path)?
+        } else {
+            update_candidate_progress(
+                run_dir,
+                candidate_index,
+                Some(ProgressStatus::InProgress),
+                Some(&format!(
+                    "verify hypothesis {:04}",
+                    artifact.hypothesis_index
+                )),
+                None,
+            )?;
+            log_step(
+                verbose,
+                "verify",
+                format!(
+                    "verifying hypothesis {:04} from cluster {}",
+                    artifact.hypothesis_index, artifact.finalist.cluster_title
+                ),
+            );
+            let analysis = provider.verify_candidate(ProviderRequest {
+                working_dir,
+                prompt: &artifact.prompt,
+                schema,
+                pass_dir: &artifact.pass_dir,
+                candidate_index,
+                phase: AnalysisPhase::Verify,
+                model,
+                effort,
+                verbose,
+            })?;
+            persist_verification_analysis(&artifact.pass_dir, &analysis)?;
+            analysis
+        };
+        results.push(CodexVerificationRecord {
+            hypothesis_index: artifact.hypothesis_index,
+            finalist: artifact.finalist.clone(),
+            analysis,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Merges independent verification passes into one final candidate verification result.
+fn merge_codex_verification_results(records: &[CodexVerificationRecord]) -> VerificationAnalysis {
+    let confirmed_findings = records
+        .iter()
+        .flat_map(|record| record.analysis.confirmed_findings.iter().cloned())
+        .collect::<Vec<_>>();
+    let confirmed_hypotheses = records
+        .iter()
+        .filter(|record| !record.analysis.confirmed_findings.is_empty())
+        .map(|record| format!("{:04}", record.hypothesis_index))
+        .collect::<Vec<_>>();
+    let inconclusive_count = records
+        .iter()
+        .filter(|record| record.analysis.verdict == VerificationVerdict::Inconclusive)
+        .count();
+    let rejected_count = records
+        .iter()
+        .filter(|record| record.analysis.verdict == VerificationVerdict::Rejected)
+        .count();
+
+    let verdict = if !confirmed_findings.is_empty() {
+        VerificationVerdict::Confirmed
+    } else if inconclusive_count > 0 {
+        VerificationVerdict::Inconclusive
+    } else {
+        VerificationVerdict::Rejected
+    };
+
+    let verification_summary = if confirmed_findings.is_empty() {
+        format!(
+            "Independently reviewed {} finalist hypothesis(es). No finalist was confirmed; {} remained inconclusive and {} were rejected.",
+            records.len(),
+            inconclusive_count,
+            rejected_count
+        )
+    } else {
+        format!(
+            "Independently reviewed {} finalist hypothesis(es). Confirmed {} finding(s) from hypothesis {}. {} additional hypothesis(es) were inconclusive and {} were rejected.",
+            records.len(),
+            confirmed_findings.len(),
+            confirmed_hypotheses.join(", "),
+            inconclusive_count,
+            rejected_count
+        )
+    };
+
+    VerificationAnalysis {
+        verification_summary,
+        verdict,
+        confirmed_findings,
+    }
 }
 
 /// Builds the Codex-facing commit summary that points to persisted evidence files.
@@ -3594,10 +3637,11 @@ impl ProgressUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexReachabilityRecord, absolute_artifact_path, bundle_snapshot_path, ensure_manifest,
-        initialize_progress_state, load_progress_state, load_saved_candidate_outcome,
-        manifests_match, merge_codex_inventory_results, persist_candidate_outcome,
-        select_adjudication_finalists, select_inventory_focuses, should_keep_reachability_result,
+        CodexReachabilityRecord, CodexVerificationRecord, absolute_artifact_path,
+        bundle_snapshot_path, ensure_manifest, initialize_progress_state, load_progress_state,
+        load_saved_candidate_outcome, manifests_match, merge_codex_inventory_results,
+        merge_codex_verification_results, persist_candidate_outcome, select_inventory_focuses,
+        select_verification_candidates, should_keep_reachability_result,
         should_review_reachability, validate_args,
     };
     use crate::cli::{AnalyzeArgs, PipelineStage, ProviderKind};
@@ -3606,7 +3650,7 @@ mod tests {
         CandidateOutcome, CommitCandidate, CommitRecord, InteractionAnalysis, InteractionKind,
         InteractionVerdict, ProgressResult, ProgressStatus, ReachabilityAnalysis,
         ReachabilityAssessment, ReachabilitySurface, ReachabilityVerdict, RunManifest,
-        ScreeningAnalysis, SuspiciousFinding,
+        ScreeningAnalysis, SuspiciousFinding, VerificationAnalysis, VerificationVerdict,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3951,8 +3995,8 @@ mod tests {
     }
 
     #[test]
-    fn adjudication_finalists_fall_back_to_interaction_refined_finding() {
-        let finalists = select_adjudication_finalists(&[sample_reachability_record_with_cluster(
+    fn verification_candidates_fall_back_to_interaction_refined_finding() {
+        let finalists = select_verification_candidates(&[sample_reachability_record_with_cluster(
             9,
             sample_cluster_with_files(
                 "digest_length_verify",
@@ -4004,7 +4048,7 @@ mod tests {
     }
 
     #[test]
-    fn adjudication_finalists_prioritize_interaction_theories_over_local_api_only() {
+    fn verification_candidates_keep_multiple_theories_without_ranking() {
         let local_api = sample_reachability_record(
             1,
             "digest_length_sign",
@@ -4066,10 +4110,10 @@ mod tests {
             },
         );
 
-        let finalists = select_adjudication_finalists(&[local_api, interaction])
+        let finalists = select_verification_candidates(&[local_api, interaction])
             .expect("selection should work");
 
-        assert_eq!(finalists[0].hypothesis_index, 2);
+        assert_eq!(finalists.len(), 2);
         assert!(
             finalists
                 .iter()
@@ -4079,6 +4123,46 @@ mod tests {
             finalists
                 .iter()
                 .any(|finalist| finalist.hypothesis_index == 2)
+        );
+    }
+
+    #[test]
+    fn merged_verification_results_keep_multiple_confirmed_findings() {
+        let merged = merge_codex_verification_results(&[
+            sample_verification_record(
+                1,
+                "asn binding",
+                VerificationAnalysis {
+                    verification_summary: "confirmed asn".into(),
+                    verdict: VerificationVerdict::Confirmed,
+                    confirmed_findings: vec![sample_finding(
+                        "asn binding accepted mismatched oid",
+                        0.94,
+                        "wolfcrypt/src/asn.c",
+                    )],
+                },
+            ),
+            sample_verification_record(
+                2,
+                "ecdsa digest",
+                VerificationAnalysis {
+                    verification_summary: "confirmed digest".into(),
+                    verdict: VerificationVerdict::Confirmed,
+                    confirmed_findings: vec![sample_finding(
+                        "ecdsa verify accepted undersized digest",
+                        0.88,
+                        "src/pk_ec.c",
+                    )],
+                },
+            ),
+        ]);
+
+        assert_eq!(merged.verdict, VerificationVerdict::Confirmed);
+        assert_eq!(merged.confirmed_findings.len(), 2);
+        assert!(
+            merged
+                .verification_summary
+                .contains("Confirmed 2 finding(s) from hypothesis 0001, 0002")
         );
     }
 
@@ -4231,6 +4315,31 @@ mod tests {
             hypothesis_index,
             cluster,
             interaction_analysis,
+            analysis,
+        }
+    }
+
+    fn sample_verification_record(
+        hypothesis_index: usize,
+        title: &str,
+        analysis: VerificationAnalysis,
+    ) -> CodexVerificationRecord {
+        CodexVerificationRecord {
+            hypothesis_index,
+            finalist: super::CodexAdjudicationCandidate {
+                hypothesis_index,
+                cluster_title: title.into(),
+                cluster_category: "category".into(),
+                interaction_summary: "interaction".into(),
+                interaction_verdict: InteractionVerdict::Plausible,
+                interaction_kind: InteractionKind::DirectPath,
+                reachability_summary: "reachability".into(),
+                reachability_verdict: ReachabilityVerdict::Weak,
+                reachability_assessment: ReachabilityAssessment::InteractionDependent,
+                surface: ReachabilitySurface::Unknown,
+                preconditions: vec![],
+                refined_finding: sample_finding(title, 0.8, "src/a.rs"),
+            },
             analysis,
         }
     }

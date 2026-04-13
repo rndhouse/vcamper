@@ -60,23 +60,23 @@ Useful flags:
 - `--rerun-stages <inventory,synthesis,interaction,reachability,verify>`: clear the named stage and every downstream stage before continuing from the same `--out` directory
 - `--verbose`: print detailed internal logs and streamed provider output
 
-Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there. Stage-scoped Codex runs also reuse earlier stage artifacts from the same `--out` directory, so you can execute inventory, synthesis, interaction, reachability, and adjudication in separate invocations without repeating completed work unless you pass `--rerun-stages`.
+Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there. Stage-scoped Codex runs also reuse earlier stage artifacts from the same `--out` directory, so you can execute inventory, synthesis, interaction, reachability, and final verification in separate invocations without repeating completed work unless you pass `--rerun-stages`.
 
 By default, VCamper suppresses provider event output in the terminal. The default terminal view shows candidate progress and an active spinner while the provider is working.
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
-For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as four staged invocations plus final adjudication inside each candidate:
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as four staged invocations plus independent finalist verification inside each candidate:
 
 - inventory: derive a ranked hotspot plan from the full patch and run one narrow focus prompt per hotspot file so the first-stage theories do not compete inside one broad prompt
 - synthesis: merge related inventory results into stronger shared theories before later stages prune or rank them
 - interaction review: inspect each hypothesis for mixed-feature, shared-flow, or compile-time interaction signals that ordinary reachability review could miss
 - reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface without prematurely discarding interaction-dependent theories
-- adjudication: compare only the shortlisted reachability survivors and pick the strongest supported finding, or reject them all
+- verify: review each reachability survivor independently and keep every finalist that still verifies as a plausible security fix
 
-That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, synthesis, interaction review, or reachability before continuing. Use `--start-at-stage` to continue from a later boundary with the same `--out` directory. Use `--inventory-focuses` when you want to rerun only a shortlist of hotspot focus units through later stages.
+That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and lets final verification confirm multiple distinct theories from one noisy commit instead of forcing them to compete inside one prompt. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, synthesis, interaction review, or reachability before continuing. Use `--start-at-stage` to continue from a later boundary with the same `--out` directory. Use `--inventory-focuses` when you want to rerun only a shortlist of hotspot focus units through later stages.
 
-VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, synthesis, interaction, reachability, or adjudication.
+VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, synthesis, interaction, reachability, or finalist verification.
 
 The analysis flow is still reported as `screen` then `verify`, but Codex internally expands that into:
 
@@ -84,7 +84,7 @@ The analysis flow is still reported as `screen` then `verify`, but Codex interna
 - `screen/synthesis`: category-level synthesis that combines related inventory results into stronger shared theories
 - `screen/interaction`: one-hypothesis interaction review for shared verification flows, feature combinations, and compile-time branches
 - `screen/reachability`: one-hypothesis exploit-path review with compact bundles
-- `verify`: final adjudication over reachability-shortlisted finalists, with the commit message restored as secondary context
+- `verify`: one-finalist-at-a-time verification over reachability survivors, with the commit message restored as secondary context
 
 ## Requirements
 
@@ -127,14 +127,11 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `candidate-*/screen/reachability/analysis.json`: merged screening result after reachability filtering
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output
 - `candidate-*/screen/analysis.json`: completed screening result after staged inventory and reachability
-- `candidate-*/verify/prompt-input.json`: adjudication evidence including shortlisted finalists and the commit message
-- `candidate-*/verify/prompt.txt`: rendered verifier prompt
-- `candidate-*/verify/evidence/patch.diff`: full untruncated patch for the verification pass
-- `candidate-*/verify/evidence/changed-files.txt`: changed file list for the verification pass
-- `candidate-*/verify/evidence/hotspots.json`: hotspot plan reused during verification
-- `candidate-*/verify/evidence/file-snapshots.json`: manifest of before/after snapshots for changed files
-- `candidate-*/verify/evidence/before/*` and `candidate-*/verify/evidence/after/*`: file snapshots available to Codex during verification
-- `candidate-*/verify/stdout.txt` and `candidate-*/verify/stderr.txt`: verifier provider output
+- `candidate-*/verify/hypothesis-*/prompt-input.json` and `prompt.txt`: one-finalist verification evidence and prompt
+- `candidate-*/verify/hypothesis-*/evidence/*`: finalist-local patch subset, hotspot plan, and snapshots for one verification pass
+- `candidate-*/verify/hypothesis-*/analysis.json`: one finalist verification verdict and any confirmed findings
+- `candidate-*/verify/hypothesis-*/stdout.txt` and `stderr.txt`: verifier provider output for one finalist
+- `candidate-*/verify/results.json`: merged per-finalist verification records
 - `candidate-*/verify/analysis.json`: completed verifier result
 - `candidate-*/stage-state.json`: highest completed internal stage for the candidate and whether the full pipeline finished
 - `candidate-*/outcome.json`: final combined candidate outcome across both passes

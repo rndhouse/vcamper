@@ -240,23 +240,18 @@ pub(crate) fn render_verify_prompt(
 pub(crate) fn render_codex_verify_prompt(prompt_input_path: &Path) -> String {
     format!(
         "{VERIFY_COMMIT_TEMPLATE}\n\n\
-         All evidence for this adjudication pass is available in the bundle referenced by\n\
+         All evidence for this finalist-verification pass is available in the bundle referenced by\n\
          `{prompt_input_path}`.\n\
          Start with that `prompt-input.json` file.\n\
          Then inspect the absolute file paths it provides for the patch, hotspot plan, snapshots,\n\
-         and adjudication finalists.\n\
+         and the single verification finalist.\n\
          Use the commit message as secondary context.\n\
-         Compare the shortlisted finalists head-to-head and pick the strongest supported security\n\
-         story, or reject them all.\n\
-         Some finalists may remain because interaction review kept them alive despite weak direct\n\
-         reachability. Evaluate those explicitly instead of dismissing them as mere local API\n\
-         hardening by reflex.\n\
-         When a plain local-API bug and an interaction-dependent verification theory are both\n\
-         plausible, prefer the interaction-dependent theory only if the code evidence shows a\n\
-         stronger trust-boundary consequence or a shared certificate or signed-object validation\n\
-         path.\n\
-         Do not union all finalists into the output. Prefer one winner, or none, when several\n\
-         hypotheses describe the same commit from different angles.\n\
+         Verify only the supplied finalist. Do not compare it against other theories and do not\n\
+         try to pick one winner for the whole commit.\n\
+         Some finalists reach this stage because interaction review kept them alive despite weak\n\
+         direct reachability. Evaluate that supplied finalist explicitly instead of dismissing it\n\
+         as mere local API hardening by reflex.\n\
+         Return at most one confirmed finding derived from this finalist, or reject it.\n\
          Return a JSON object that matches the supplied schema.\n\
          Use an empty confirmed_findings array when no finalist holds up.\n",
         prompt_input_path = prompt_input_path.display(),
@@ -437,9 +432,9 @@ mod tests {
         let prompt = render_codex_verify_prompt(Path::new("/tmp/verify/prompt-input.json"));
 
         assert!(prompt.contains("/tmp/verify/prompt-input.json"));
-        assert!(prompt.contains("adjudication finalists"));
+        assert!(prompt.contains("single verification finalist"));
         assert!(prompt.contains("interaction review kept them alive"));
-        assert!(prompt.contains("one winner, or none"));
+        assert!(prompt.contains("Verify only the supplied finalist"));
         assert!(!prompt.contains("Repository root:"));
     }
 }

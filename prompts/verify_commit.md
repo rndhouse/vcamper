@@ -40,7 +40,7 @@ Check whether the patch removes or fences off a legacy, compatibility, fallback,
 
 Use the commit message only after you have reasoned about the code. State whether it honestly describes the change, understates the security consequence, or reads like ordinary maintenance wrapped around a stronger security fix.
 
-If the strongest screened hypothesis fails, continue with the remaining hotspot clusters and look for a stronger alternative before you return `rejected`. Reject the candidate only when you have challenged the screened explanation and still do not see a stable security conclusion elsewhere in the changed verification, parser, or cryptographic paths.
+Some verification passes cover the whole candidate, while others cover one shortlisted finalist. If this pass supplies only one finalist, verify that finalist on its own and do not search for alternative theories elsewhere in the patch. If this pass supplies the whole candidate, continue with the remaining hotspot clusters and look for a stronger alternative before you return `rejected`.
 
 Treat these crypto-specific patterns as high-signal during verification:
 
