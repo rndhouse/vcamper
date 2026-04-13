@@ -176,6 +176,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     let screen_schema = screening_schema()?;
     let synthesis_schema = screening_schema()?;
     let interaction_review_schema = interaction_schema()?;
+    let composite_review_schema = interaction_schema()?;
     let reachability_review_schema = reachability_schema()?;
     let verify_schema = verification_schema()?;
     let provider = build_provider(args.provider);
@@ -368,6 +369,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 &screen_schema,
                 &synthesis_schema,
                 &interaction_review_schema,
+                &composite_review_schema,
                 &reachability_review_schema,
                 args.model.as_deref(),
                 screen_effort,
@@ -868,6 +870,13 @@ struct CodexSynthesisGroup {
     focus_results: Vec<CodexInventoryFocusResult>,
 }
 
+#[derive(Debug, Clone)]
+struct CodexCompositeGroup {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    source_hypotheses: Vec<CodexInteractionRecord>,
+}
+
 #[derive(Debug, Serialize)]
 struct CodexSynthesisPromptInput {
     candidate_index: usize,
@@ -883,6 +892,15 @@ struct CodexInteractionPromptInput {
     hotspot_plan: HotspotPlan,
     cluster: HotspotCluster,
     inventory_hypothesis: SuspiciousFinding,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexCompositePromptInput {
+    candidate_index: usize,
+    commit: CodexPromptCommit,
+    hotspot_plan: HotspotPlan,
+    cluster: HotspotCluster,
+    source_hypotheses: Vec<CodexInteractionRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -996,6 +1014,15 @@ struct CodexInteractionRecord {
 }
 
 #[derive(Debug, Clone)]
+struct CodexCompositeArtifacts {
+    hypothesis_index: usize,
+    cluster: HotspotCluster,
+    source_hypotheses: Vec<CodexInteractionRecord>,
+    pass_dir: PathBuf,
+    prompt: String,
+}
+
+#[derive(Debug, Clone)]
 struct CodexReachabilityArtifacts {
     hypothesis_index: usize,
     cluster: HotspotCluster,
@@ -1027,6 +1054,12 @@ struct CodexSynthesisMergeOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexInteractionStageOutput {
+    analysis: ScreeningAnalysis,
+    records: Vec<CodexInteractionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexCompositeStageOutput {
     analysis: ScreeningAnalysis,
     records: Vec<CodexInteractionRecord>,
 }
@@ -1108,6 +1141,11 @@ fn synthesis_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("synthesis")
 }
 
+/// Returns the composite-synthesis-stage artifact root for one screen pass.
+fn composite_stage_dir(screen_dir: &Path) -> PathBuf {
+    screen_dir.join("composite_synthesis")
+}
+
 /// Returns the reachability-stage artifact root for one screen pass.
 fn reachability_stage_dir(screen_dir: &Path) -> PathBuf {
     screen_dir.join("reachability")
@@ -1131,6 +1169,11 @@ fn synthesis_results_path(screen_dir: &Path) -> PathBuf {
 /// Returns the persisted interaction-stage results path.
 fn interaction_results_path(screen_dir: &Path) -> PathBuf {
     interaction_stage_dir(screen_dir).join("results.json")
+}
+
+/// Returns the persisted composite-synthesis-stage results path.
+fn composite_results_path(screen_dir: &Path) -> PathBuf {
+    composite_stage_dir(screen_dir).join("results.json")
 }
 
 /// Returns the persisted reachability-stage results path.
@@ -1312,6 +1355,23 @@ fn persist_interaction_stage_output(
     persist_stage_results(&interaction_results_path(screen_dir), output)
 }
 
+/// Loads persisted composite-synthesis-stage output when it exists.
+fn load_composite_stage_output(screen_dir: &Path) -> Result<Option<CodexCompositeStageOutput>> {
+    let path = composite_results_path(screen_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json_file(&path).map(Some)
+}
+
+/// Persists merged composite-synthesis-stage output.
+fn persist_composite_stage_output(
+    screen_dir: &Path,
+    output: &CodexCompositeStageOutput,
+) -> Result<()> {
+    persist_stage_results(&composite_results_path(screen_dir), output)
+}
+
 /// Loads persisted reachability-stage output when it exists.
 fn load_reachability_stage_output(
     screen_dir: &Path,
@@ -1350,6 +1410,7 @@ fn run_codex_screening_pipeline(
     inventory_schema: &str,
     synthesis_schema: &str,
     interaction_schema: &str,
+    composite_schema: &str,
     reachability_schema: &str,
     model: Option<&str>,
     effort: Option<crate::cli::ReasoningEffort>,
@@ -1582,6 +1643,97 @@ fn run_codex_screening_pipeline(
         run_dir,
         candidate.candidate_index,
         Some(ProgressStatus::InProgress),
+        Some("screen composite_synthesis"),
+        None,
+    )?;
+    let composite_stage = if execution_plan.includes(PipelineStage::CompositeSynthesis) {
+        if !execution_plan.should_rerun(PipelineStage::CompositeSynthesis) {
+            if let Some(existing) = load_composite_stage_output(screen_dir)? {
+                existing
+            } else {
+                let composite_artifacts = prepare_codex_composite_artifacts(
+                    repo_root,
+                    screen_dir,
+                    candidate,
+                    artifacts,
+                    &interaction_stage.records,
+                )?;
+                let composite_records = run_codex_composite(
+                    provider,
+                    repo_root,
+                    &composite_artifacts,
+                    run_dir,
+                    composite_schema,
+                    candidate.candidate_index,
+                    model,
+                    effort,
+                    verbose,
+                )?;
+                let analysis =
+                    merge_codex_composite_results(&interaction_stage.analysis, &composite_records);
+                CodexCompositeStageOutput {
+                    analysis,
+                    records: composite_records,
+                }
+            }
+        } else {
+            let composite_artifacts = prepare_codex_composite_artifacts(
+                repo_root,
+                screen_dir,
+                candidate,
+                artifacts,
+                &interaction_stage.records,
+            )?;
+            let composite_records = run_codex_composite(
+                provider,
+                repo_root,
+                &composite_artifacts,
+                run_dir,
+                composite_schema,
+                candidate.candidate_index,
+                model,
+                effort,
+                verbose,
+            )?;
+            let analysis =
+                merge_codex_composite_results(&interaction_stage.analysis, &composite_records);
+            CodexCompositeStageOutput {
+                analysis,
+                records: composite_records,
+            }
+        }
+    } else if let Some(existing) = load_composite_stage_output(screen_dir)? {
+        existing
+    } else {
+        CodexCompositeStageOutput {
+            analysis: interaction_stage.analysis.clone(),
+            records: Vec::new(),
+        }
+    };
+    let composite_dir = composite_stage_dir(screen_dir);
+    fs::create_dir_all(&composite_dir)
+        .with_context(|| format!("failed to create {}", composite_dir.display()))?;
+    persist_screening_analysis(&composite_dir, &composite_stage.analysis)?;
+    persist_composite_stage_output(screen_dir, &composite_stage)?;
+
+    if execution_plan.stops_after(PipelineStage::CompositeSynthesis) {
+        return Ok(CodexScreeningPipelineOutput {
+            screening: composite_stage.analysis,
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            reachability_results: Vec::new(),
+            highest_completed_stage: PipelineStage::CompositeSynthesis,
+            pipeline_complete: false,
+        });
+    }
+
+    let reachability_inputs = combine_interaction_and_composite_records(
+        &interaction_stage.records,
+        &composite_stage.records,
+    );
+    update_candidate_progress(
+        run_dir,
+        candidate.candidate_index,
+        Some(ProgressStatus::InProgress),
         Some("screen reachability"),
         None,
     )?;
@@ -1595,7 +1747,7 @@ fn run_codex_screening_pipeline(
                     screen_dir,
                     candidate,
                     artifacts,
-                    &interaction_stage.records,
+                    &reachability_inputs,
                 )?;
                 let reachability_results = run_codex_reachability(
                     provider,
@@ -1609,7 +1761,7 @@ fn run_codex_screening_pipeline(
                     verbose,
                 )?;
                 let analysis = merge_codex_reachability_results(
-                    artifacts.clusters.len(),
+                    reachability_results.len(),
                     &reachability_results,
                 );
                 CodexReachabilityStageOutput {
@@ -1623,7 +1775,7 @@ fn run_codex_screening_pipeline(
                 screen_dir,
                 candidate,
                 artifacts,
-                &interaction_stage.records,
+                &reachability_inputs,
             )?;
             let reachability_results = run_codex_reachability(
                 provider,
@@ -1637,7 +1789,7 @@ fn run_codex_screening_pipeline(
                 verbose,
             )?;
             let analysis =
-                merge_codex_reachability_results(artifacts.clusters.len(), &reachability_results);
+                merge_codex_reachability_results(reachability_results.len(), &reachability_results);
             CodexReachabilityStageOutput {
                 analysis,
                 records: reachability_results,
@@ -2249,6 +2401,308 @@ fn merge_codex_interaction_results(
     }
 }
 
+/// Builds additive composite-synthesis groups from preserved interaction results.
+fn build_composite_groups(
+    interaction_results: &[CodexInteractionRecord],
+) -> Vec<CodexCompositeGroup> {
+    let preserved = interaction_results
+        .iter()
+        .filter(|record| {
+            (record.analysis.preserve_for_reachability || record.analysis.preserve_for_adjudication)
+                && record.analysis.refined_finding.is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let digest_records = preserved
+        .iter()
+        .filter(|record| record.cluster.category == "digest_length_verify")
+        .cloned()
+        .collect::<Vec<_>>();
+    let binding_records = preserved
+        .iter()
+        .filter(|record| record.cluster.category == "algorithm_binding")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if digest_records.is_empty() || binding_records.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::new();
+    for record in binding_records.iter().chain(digest_records.iter()) {
+        if selected.iter().all(|existing: &CodexInteractionRecord| {
+            existing.hypothesis_index != record.hypothesis_index
+        }) {
+            selected.push(record.clone());
+        }
+    }
+    for record in &preserved {
+        let mut files = BTreeSet::new();
+        for path in &record.cluster.files {
+            files.insert(path.as_str());
+        }
+        if files.contains("src/internal.c")
+            || files.contains("wolfcrypt/src/pkcs7.c")
+            || files.contains("wolfcrypt/src/asn.c")
+        {
+            if selected
+                .iter()
+                .all(|existing| existing.hypothesis_index != record.hypothesis_index)
+            {
+                selected.push(record.clone());
+            }
+        }
+    }
+
+    if selected.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut files = BTreeSet::new();
+    let mut function_hints = BTreeSet::new();
+    let mut signal_terms = BTreeSet::new();
+    let mut score = 0usize;
+    let mut cluster_index = 0usize;
+    for record in &selected {
+        score += record.cluster.score;
+        cluster_index = cluster_index.max(record.cluster.cluster_index);
+        for path in &record.cluster.files {
+            files.insert(path.clone());
+        }
+        for hint in &record.cluster.function_hints {
+            function_hints.insert(hint.clone());
+        }
+        for term in &record.cluster.signal_terms {
+            signal_terms.insert(term.clone());
+        }
+    }
+    signal_terms.insert("composite_verification_story".to_owned());
+    signal_terms.insert("mixed_feature_verification".to_owned());
+
+    vec![CodexCompositeGroup {
+        hypothesis_index: interaction_results
+            .iter()
+            .map(|record| record.hypothesis_index)
+            .max()
+            .unwrap_or(0)
+            + 1,
+        cluster: HotspotCluster {
+            cluster_index: cluster_index + 1,
+            title: "Composite certificate-verification synthesis".to_owned(),
+            rationale: "Combine digest-length and algorithm-binding theories when one patch tightens shared signed-object verification invariants across multiple verification layers.".to_owned(),
+            category: "composite_crypto_verification".to_owned(),
+            files: files.into_iter().collect(),
+            function_hints: function_hints.into_iter().collect(),
+            signal_terms: signal_terms.into_iter().collect(),
+            score,
+        },
+        source_hypotheses: selected,
+    }]
+}
+
+/// Builds a fallback finding when composite synthesis preserves a theory without refining it.
+fn fallback_composite_finding(group: &CodexCompositeGroup) -> SuspiciousFinding {
+    let mut affected_files = BTreeSet::new();
+    let mut evidence = Vec::new();
+    for record in &group.source_hypotheses {
+        if let Some(finding) = &record.analysis.refined_finding {
+            for path in &finding.affected_files {
+                affected_files.insert(path.clone());
+            }
+            evidence.push(format!(
+                "Composite source hypothesis {:04}: {}",
+                record.hypothesis_index, finding.title
+            ));
+        }
+    }
+
+    SuspiciousFinding {
+        title: "Composite certificate-verification theory".to_owned(),
+        confidence: 0.75,
+        commit_id: group
+            .source_hypotheses
+            .first()
+            .map(|record| {
+                record
+                    .analysis
+                    .refined_finding
+                    .as_ref()
+                    .map(|finding| finding.commit_id.clone())
+                    .unwrap_or_else(|| record.inventory_finding.commit_id.clone())
+            })
+            .unwrap_or_default(),
+        rationale: "Grouped digest-length and algorithm-binding changes describe one broader certificate or signed-object verification hardening story.".to_owned(),
+        likely_bug_class: Some("composite verification hardening".to_owned()),
+        affected_files: affected_files.into_iter().collect(),
+        evidence,
+        follow_up: vec![
+            "Trace certificate, CSR, CRL, OCSP, and PKCS#7 verification flows through the grouped helpers.".to_owned(),
+            "Check whether mixed algorithm-family enablement changes which verification path consumes these guards.".to_owned(),
+        ],
+    }
+}
+
+/// Prepares one composite-synthesis bundle for each grouped set of interaction survivors.
+fn prepare_codex_composite_artifacts(
+    repo_root: &Path,
+    screen_dir: &Path,
+    candidate: &CommitCandidate,
+    artifacts: &CodexInventoryPlanArtifacts,
+    interaction_results: &[CodexInteractionRecord],
+) -> Result<Vec<CodexCompositeArtifacts>> {
+    let composite_dir = composite_stage_dir(screen_dir);
+    fs::create_dir_all(&composite_dir)
+        .with_context(|| format!("failed to create {}", composite_dir.display()))?;
+
+    let groups = build_composite_groups(interaction_results);
+    let mut outputs = Vec::with_capacity(groups.len());
+    for (group_index, group) in groups.iter().enumerate() {
+        let group_dir = composite_dir.join(format!("group-{group_index:04}"));
+        fs::create_dir_all(&group_dir)
+            .with_context(|| format!("failed to create {}", group_dir.display()))?;
+        let selected_files = group.cluster.files.clone();
+        let filtered_patch = filtered_patch_for_selection(&artifacts.full_patch, &selected_files);
+        let evidence = persist_codex_evidence_bundle(
+            &group_dir,
+            repo_root,
+            candidate,
+            &selected_files,
+            &filtered_patch,
+            &artifacts.hotspot_plan,
+        )?;
+        let prompt_input = CodexCompositePromptInput {
+            candidate_index: candidate.candidate_index,
+            commit: build_codex_prompt_commit(candidate, evidence),
+            hotspot_plan: artifacts.hotspot_plan.clone(),
+            cluster: group.cluster.clone(),
+            source_hypotheses: group.source_hypotheses.clone(),
+        };
+        let prompt_input_path = absolute_artifact_path(&group_dir.join("prompt-input.json"))?;
+        let prompt = prompt::render_codex_composite_prompt(Path::new(&prompt_input_path));
+        persist_pass_artifacts(&group_dir, &prompt_input, &prompt)?;
+        outputs.push(CodexCompositeArtifacts {
+            hypothesis_index: group.hypothesis_index,
+            cluster: group.cluster.clone(),
+            source_hypotheses: group.source_hypotheses.clone(),
+            pass_dir: group_dir,
+            prompt,
+        });
+    }
+
+    Ok(outputs)
+}
+
+/// Runs one composite-synthesis review for each grouped set of interaction survivors.
+fn run_codex_composite(
+    provider: &dyn crate::provider::AgentProvider,
+    working_dir: &Path,
+    artifacts: &[CodexCompositeArtifacts],
+    run_dir: &Path,
+    schema: &str,
+    candidate_index: usize,
+    model: Option<&str>,
+    effort: Option<crate::cli::ReasoningEffort>,
+    verbose: bool,
+) -> Result<Vec<CodexInteractionRecord>> {
+    let mut results = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        update_candidate_progress(
+            run_dir,
+            candidate_index,
+            Some(ProgressStatus::InProgress),
+            Some(&format!(
+                "screen composite_synthesis hypothesis {:04}",
+                artifact.hypothesis_index
+            )),
+            None,
+        )?;
+        log_step(
+            verbose,
+            "composite_synthesis",
+            format!(
+                "reviewing composite hypothesis {:04} from {} source hypothesis(es)",
+                artifact.hypothesis_index,
+                artifact.source_hypotheses.len()
+            ),
+        );
+        let analysis = provider.review_interaction(ProviderRequest {
+            working_dir,
+            prompt: &artifact.prompt,
+            schema,
+            pass_dir: &artifact.pass_dir,
+            candidate_index,
+            phase: AnalysisPhase::Screen,
+            model,
+            effort,
+            verbose,
+        })?;
+        persist_interaction_analysis(&artifact.pass_dir, &analysis)?;
+        if !(analysis.preserve_for_reachability || analysis.preserve_for_adjudication) {
+            continue;
+        }
+        results.push(CodexInteractionRecord {
+            hypothesis_index: artifact.hypothesis_index,
+            cluster: artifact.cluster.clone(),
+            inventory_finding: analysis.refined_finding.clone().unwrap_or_else(|| {
+                fallback_composite_finding(&CodexCompositeGroup {
+                    hypothesis_index: artifact.hypothesis_index,
+                    cluster: artifact.cluster.clone(),
+                    source_hypotheses: artifact.source_hypotheses.clone(),
+                })
+            }),
+            analysis,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Merges additive composite-synthesis results into a current screening view.
+fn merge_codex_composite_results(
+    interaction_analysis: &ScreeningAnalysis,
+    composite_records: &[CodexInteractionRecord],
+) -> ScreeningAnalysis {
+    let mut findings = interaction_analysis.suspicious_findings.clone();
+    let mut added = Vec::new();
+    for record in composite_records {
+        if let Some(finding) = &record.analysis.refined_finding {
+            findings.push(finding.clone());
+            added.push(record.cluster.title.clone());
+        }
+    }
+
+    let candidate_summary = if added.is_empty() {
+        "Reviewed interaction survivors for cross-category composite theories. No stronger composite theory survived beyond the existing interaction results.".to_owned()
+    } else {
+        format!(
+            "Reviewed interaction survivors for cross-category composite theories. Added composite theories from: {}.",
+            added.join("; ")
+        )
+    };
+
+    ScreeningAnalysis {
+        candidate_summary,
+        suspicious_findings: findings,
+    }
+}
+
+/// Combines original interaction survivors with additive composite survivors.
+fn combine_interaction_and_composite_records(
+    interaction_records: &[CodexInteractionRecord],
+    composite_records: &[CodexInteractionRecord],
+) -> Vec<CodexInteractionRecord> {
+    let mut combined = interaction_records.to_vec();
+    for record in composite_records {
+        if combined
+            .iter()
+            .all(|existing| existing.hypothesis_index != record.hypothesis_index)
+        {
+            combined.push(record.clone());
+        }
+    }
+    combined
+}
+
 /// Prepares one reachability bundle for each inventoried hypothesis.
 fn prepare_codex_reachability_artifacts(
     repo_root: &Path,
@@ -2360,7 +2814,7 @@ fn run_codex_reachability(
 
 /// Merges reachability-reviewed hypotheses into the final screening result.
 fn merge_codex_reachability_results(
-    cluster_count: usize,
+    review_count: usize,
     reachability_results: &[CodexReachabilityRecord],
 ) -> ScreeningAnalysis {
     let mut supported = Vec::new();
@@ -2413,13 +2867,13 @@ fn merge_codex_reachability_results(
 
     let candidate_summary = if supported.is_empty() {
         format!(
-            "Reviewed {} hotspot cluster(s) through staged reachability analysis. No hypothesis kept a stable attacker-controlled path.",
-            cluster_count
+            "Reviewed {} staged hypothesis bundle(s) through reachability analysis. No hypothesis kept a stable attacker-controlled path.",
+            review_count
         )
     } else {
         format!(
-            "Reviewed {} hotspot cluster(s) through staged reachability analysis. Surviving hypotheses came from: {}.",
-            cluster_count,
+            "Reviewed {} staged hypothesis bundle(s) through reachability analysis. Surviving hypotheses came from: {}.",
+            review_count,
             surfaces.join("; ")
         )
     };
@@ -3371,6 +3825,10 @@ fn clear_stage_artifacts(
             interaction_stage_dir(&screen_dir),
         ),
         (
+            PipelineStage::CompositeSynthesis,
+            composite_stage_dir(&screen_dir),
+        ),
+        (
             PipelineStage::Reachability,
             reachability_stage_dir(&screen_dir),
         ),
@@ -3417,6 +3875,7 @@ fn parse_pipeline_stage(value: &str) -> Result<PipelineStage> {
         "inventory" => Ok(PipelineStage::Inventory),
         "synthesis" => Ok(PipelineStage::Synthesis),
         "interaction" => Ok(PipelineStage::Interaction),
+        "composite_synthesis" | "composite-synthesis" => Ok(PipelineStage::CompositeSynthesis),
         "reachability" => Ok(PipelineStage::Reachability),
         "verify" => Ok(PipelineStage::Verify),
         _ => bail!("unknown pipeline stage `{value}`"),
@@ -3441,6 +3900,16 @@ fn infer_candidate_stage_state(candidate_dir: &Path) -> Result<Option<CandidateS
         return Ok(Some(CandidateStageState {
             highest_completed_stage: PipelineStage::Reachability.as_str().to_owned(),
             pipeline_complete: true,
+        }));
+    }
+    if composite_results_path(&screen_dir).exists()
+        || composite_stage_dir(&screen_dir)
+            .join("analysis.json")
+            .exists()
+    {
+        return Ok(Some(CandidateStageState {
+            highest_completed_stage: PipelineStage::CompositeSynthesis.as_str().to_owned(),
+            pipeline_complete: false,
         }));
     }
     if interaction_results_path(&screen_dir).exists()
@@ -3637,12 +4106,13 @@ impl ProgressUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexReachabilityRecord, CodexVerificationRecord, absolute_artifact_path,
-        bundle_snapshot_path, ensure_manifest, initialize_progress_state, load_progress_state,
-        load_saved_candidate_outcome, manifests_match, merge_codex_inventory_results,
-        merge_codex_verification_results, persist_candidate_outcome, select_inventory_focuses,
-        select_verification_candidates, should_keep_reachability_result,
-        should_review_reachability, validate_args,
+        CodexInteractionRecord, CodexReachabilityRecord, CodexVerificationRecord,
+        absolute_artifact_path, build_composite_groups, bundle_snapshot_path,
+        combine_interaction_and_composite_records, ensure_manifest, initialize_progress_state,
+        load_progress_state, load_saved_candidate_outcome, manifests_match,
+        merge_codex_inventory_results, merge_codex_verification_results, parse_pipeline_stage,
+        persist_candidate_outcome, select_inventory_focuses, select_verification_candidates,
+        should_keep_reachability_result, should_review_reachability, validate_args,
     };
     use crate::cli::{AnalyzeArgs, PipelineStage, ProviderKind};
     use crate::hotspot::HotspotCluster;
@@ -3916,6 +4386,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_pipeline_stage_accepts_composite_synthesis_aliases() {
+        assert_eq!(
+            parse_pipeline_stage("composite_synthesis").expect("underscore alias should parse"),
+            PipelineStage::CompositeSynthesis
+        );
+        assert_eq!(
+            parse_pipeline_stage("composite-synthesis").expect("kebab alias should parse"),
+            PipelineStage::CompositeSynthesis
+        );
+    }
+
+    #[test]
     fn rejected_reachability_can_survive_when_interaction_preserves_adjudication() {
         let record = sample_reachability_record(
             7,
@@ -4167,6 +4649,112 @@ mod tests {
     }
 
     #[test]
+    fn build_composite_groups_combines_digest_and_binding_theories() {
+        let digest = sample_interaction_record(
+            4,
+            sample_cluster_with_files(
+                "digest_length_verify",
+                &[
+                    "src/internal.c",
+                    "src/pk_ec.c",
+                    "wolfcrypt/src/ecc.c",
+                    "wolfssl/wolfcrypt/hash.h",
+                ],
+            ),
+            sample_finding("ecdsa digest invariant", 0.88, "src/pk_ec.c"),
+            InteractionAnalysis {
+                hypothesis_summary: "digest summary".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::SharedVerificationFlow,
+                preconditions: vec!["mixed verify helpers".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "ecdsa digest invariant",
+                    0.88,
+                    "src/pk_ec.c",
+                )),
+            },
+        );
+        let binding = sample_interaction_record(
+            7,
+            sample_cluster_with_files(
+                "algorithm_binding",
+                &["wolfcrypt/src/asn.c", "wolfcrypt/src/pkcs7.c"],
+            ),
+            sample_finding("algorithm binding mismatch", 0.94, "wolfcrypt/src/asn.c"),
+            InteractionAnalysis {
+                hypothesis_summary: "binding summary".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::FeatureInteraction,
+                preconditions: vec!["signed object verification".into()],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: true,
+                refined_finding: Some(sample_finding(
+                    "algorithm binding mismatch",
+                    0.94,
+                    "wolfcrypt/src/asn.c",
+                )),
+            },
+        );
+
+        let groups = build_composite_groups(&[digest.clone(), binding.clone()]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hypothesis_index, 8);
+        assert_eq!(groups[0].cluster.category, "composite_crypto_verification");
+        assert!(groups[0].cluster.files.contains(&"src/pk_ec.c".to_owned()));
+        assert!(
+            groups[0]
+                .cluster
+                .files
+                .contains(&"wolfcrypt/src/asn.c".to_owned())
+        );
+        assert_eq!(groups[0].source_hypotheses.len(), 2);
+    }
+
+    #[test]
+    fn combine_interaction_and_composite_records_keeps_additive_hypotheses() {
+        let base = sample_interaction_record(
+            1,
+            sample_cluster("digest_length_verify"),
+            sample_finding("digest", 0.8, "src/pk_ec.c"),
+            InteractionAnalysis {
+                hypothesis_summary: "digest".into(),
+                verdict: InteractionVerdict::Plausible,
+                interaction_kind: InteractionKind::DirectPath,
+                preconditions: vec![],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: false,
+                refined_finding: Some(sample_finding("digest", 0.8, "src/pk_ec.c")),
+            },
+        );
+        let composite = sample_interaction_record(
+            9,
+            sample_cluster_with_files(
+                "composite_crypto_verification",
+                &["src/pk_ec.c", "wolfcrypt/src/asn.c"],
+            ),
+            sample_finding("composite", 0.82, "wolfcrypt/src/asn.c"),
+            InteractionAnalysis {
+                hypothesis_summary: "composite".into(),
+                verdict: InteractionVerdict::Strong,
+                interaction_kind: InteractionKind::FeatureInteraction,
+                preconditions: vec![],
+                preserve_for_reachability: true,
+                preserve_for_adjudication: true,
+                refined_finding: Some(sample_finding("composite", 0.82, "wolfcrypt/src/asn.c")),
+            },
+        );
+
+        let combined = combine_interaction_and_composite_records(&[base], &[composite]);
+
+        assert_eq!(combined.len(), 2);
+        assert!(combined.iter().any(|record| record.hypothesis_index == 1));
+        assert!(combined.iter().any(|record| record.hypothesis_index == 9));
+    }
+
+    #[test]
     fn inventory_merge_keeps_only_primary_finding_per_focus() {
         let cluster = sample_cluster("digest_length_verify");
         let merged = merge_codex_inventory_results(
@@ -4288,6 +4876,20 @@ mod tests {
             function_hints: vec!["function".into()],
             signal_terms: vec!["signal".into()],
             score: 10,
+        }
+    }
+
+    fn sample_interaction_record(
+        hypothesis_index: usize,
+        cluster: HotspotCluster,
+        inventory_finding: SuspiciousFinding,
+        analysis: InteractionAnalysis,
+    ) -> CodexInteractionRecord {
+        CodexInteractionRecord {
+            hypothesis_index,
+            cluster,
+            inventory_finding,
+            analysis,
         }
     }
 

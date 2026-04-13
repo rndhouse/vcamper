@@ -54,35 +54,37 @@ Useful flags:
 - `--max-commits <n>`: fail fast when the range is larger than expected
 - `--max-patch-bytes <n>`: cap the diff bytes stored in truncated commit artifacts and inline fallback prompts
 - `--out <dir>`: write artifacts to a specific run directory
-- `--start-at-stage <inventory|synthesis|interaction|reachability|verify>`: start from a specific staged Codex boundary and reuse earlier stage artifacts from the same `--out` directory
-- `--stop-after-stage <inventory|synthesis|interaction|reachability|verify>`: stop after a staged Codex boundary so you can inspect one stage in isolation
+- `--start-at-stage <inventory|synthesis|interaction|composite_synthesis|reachability|verify>`: start from a specific staged Codex boundary and reuse earlier stage artifacts from the same `--out` directory
+- `--stop-after-stage <inventory|synthesis|interaction|composite_synthesis|reachability|verify>`: stop after a staged Codex boundary so you can inspect one stage in isolation
 - `--inventory-focuses <i,j,...>`: restrict Codex inventory to a specific hotspot-focus shortlist while preserving the original focus indexes in artifacts
-- `--rerun-stages <inventory,synthesis,interaction,reachability,verify>`: clear the named stage and every downstream stage before continuing from the same `--out` directory
+- `--rerun-stages <inventory,synthesis,interaction,composite_synthesis,reachability,verify>`: clear the named stage and every downstream stage before continuing from the same `--out` directory
 - `--verbose`: print detailed internal logs and streamed provider output
 
-Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there. Stage-scoped Codex runs also reuse earlier stage artifacts from the same `--out` directory, so you can execute inventory, synthesis, interaction, reachability, and final verification in separate invocations without repeating completed work unless you pass `--rerun-stages`.
+Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there. Stage-scoped Codex runs also reuse earlier stage artifacts from the same `--out` directory, so you can execute inventory, synthesis, interaction, composite synthesis, reachability, and final verification in separate invocations without repeating completed work unless you pass `--rerun-stages`.
 
 By default, VCamper suppresses provider event output in the terminal. The default terminal view shows candidate progress and an active spinner while the provider is working.
 
 Incomplete candidates live under `wip/` inside the output directory. Completed candidates are checkpointed in `progress.json` and promoted out of `wip/` so prompt, provider, and analysis artifacts remain available for inspection after the run.
 
-For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as four staged invocations plus independent finalist verification inside each candidate:
+For Codex runs, VCamper persists a pass-local evidence bundle and points the model at files instead of embedding the full patch directly in the initial prompt. Each pass gets an untruncated `evidence/patch.diff`, `evidence/changed-files.txt`, `evidence/hotspots.json`, and before/after snapshots for changed files. Codex screening now runs as five staged invocations plus independent finalist verification inside each candidate:
 
 - inventory: derive a ranked hotspot plan from the full patch and run one narrow focus prompt per hotspot file so the first-stage theories do not compete inside one broad prompt
 - synthesis: merge related inventory results into stronger shared theories before later stages prune or rank them
 - interaction review: inspect each hypothesis for mixed-feature, shared-flow, or compile-time interaction signals that ordinary reachability review could miss
+- composite synthesis: combine surviving interaction theories into broader mixed-feature or shared-verification finalists without deleting the narrower source theories
 - reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface without prematurely discarding interaction-dependent theories
 - verify: review each reachability survivor independently and keep every finalist that still verifies as a plausible security fix
 
-That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and lets final verification confirm multiple distinct theories from one noisy commit instead of forcing them to compete inside one prompt. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, synthesis, interaction review, or reachability before continuing. Use `--start-at-stage` to continue from a later boundary with the same `--out` directory. Use `--inventory-focuses` when you want to rerun only a shortlist of hotspot focus units through later stages.
+That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and lets final verification confirm multiple distinct theories from one noisy commit instead of forcing them to compete inside one prompt. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, synthesis, interaction review, composite synthesis, or reachability before continuing. Use `--start-at-stage` to continue from a later boundary with the same `--out` directory. Use `--inventory-focuses` when you want to rerun only a shortlist of hotspot focus units through later stages.
 
-VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, synthesis, interaction, reachability, or finalist verification.
+VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, synthesis, interaction, composite synthesis, reachability, or finalist verification.
 
 The analysis flow is still reported as `screen` then `verify`, but Codex internally expands that into:
 
 - `screen/inventory`: code-first focused hypothesis inventory with commit messages withheld
 - `screen/synthesis`: category-level synthesis that combines related inventory results into stronger shared theories
 - `screen/interaction`: one-hypothesis interaction review for shared verification flows, feature combinations, and compile-time branches
+- `screen/composite_synthesis`: cross-category synthesis that adds broader composite theories on top of the surviving interaction hypotheses
 - `screen/reachability`: one-hypothesis exploit-path review with compact bundles
 - `verify`: one-finalist-at-a-time verification over reachability survivors, with the commit message restored as secondary context
 
@@ -120,13 +122,17 @@ VCamper requires `--out` for every run. Each output directory contains:
 - `candidate-*/screen/interaction/hypothesis-*/prompt-input.json` and `prompt.txt`: one-hypothesis interaction-review evidence and prompt
 - `candidate-*/screen/interaction/hypothesis-*/evidence/*`: hypothesis-local patch subset, hotspot plan, and snapshots for interaction review
 - `candidate-*/screen/interaction/hypothesis-*/analysis.json`: one interaction-review verdict, preservation decision, and refined finding
-- `candidate-*/screen/interaction/analysis.json`: merged interaction-review summary before reachability
+- `candidate-*/screen/interaction/analysis.json`: merged interaction-review summary before composite synthesis
+- `candidate-*/screen/composite_synthesis/group-*/prompt-input.json` and `prompt.txt`: grouped composite-synthesis evidence and prompt
+- `candidate-*/screen/composite_synthesis/group-*/evidence/*`: grouped patch subset, hotspot plan, source-hypothesis context, and snapshots for one composite theory review
+- `candidate-*/screen/composite_synthesis/group-*/analysis.json`: one composite-synthesis verdict and any additive composite finding
+- `candidate-*/screen/composite_synthesis/analysis.json`: merged screening result after additive composite synthesis
 - `candidate-*/screen/reachability/hypothesis-*/prompt-input.json` and `prompt.txt`: one-hypothesis reachability evidence and prompt
 - `candidate-*/screen/reachability/hypothesis-*/evidence/*`: hypothesis-local patch subset, hotspot plan, and snapshots
 - `candidate-*/screen/reachability/hypothesis-*/analysis.json`: one reachability verdict and refined finding
 - `candidate-*/screen/reachability/analysis.json`: merged screening result after reachability filtering
 - `candidate-*/screen/stdout.txt` and `candidate-*/screen/stderr.txt`: screener provider output
-- `candidate-*/screen/analysis.json`: completed screening result after staged inventory and reachability
+- `candidate-*/screen/analysis.json`: completed screening result after staged inventory, composite synthesis, and reachability
 - `candidate-*/verify/hypothesis-*/prompt-input.json` and `prompt.txt`: one-finalist verification evidence and prompt
 - `candidate-*/verify/hypothesis-*/evidence/*`: finalist-local patch subset, hotspot plan, and snapshots for one verification pass
 - `candidate-*/verify/hypothesis-*/analysis.json`: one finalist verification verdict and any confirmed findings

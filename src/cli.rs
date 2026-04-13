@@ -131,6 +131,8 @@ pub(crate) enum PipelineStage {
     Inventory,
     Synthesis,
     Interaction,
+    #[value(name = "composite_synthesis")]
+    CompositeSynthesis,
     Reachability,
     Verify,
 }
@@ -142,6 +144,7 @@ impl PipelineStage {
             Self::Inventory => "inventory",
             Self::Synthesis => "synthesis",
             Self::Interaction => "interaction",
+            Self::CompositeSynthesis => "composite_synthesis",
             Self::Reachability => "reachability",
             Self::Verify => "verify",
         }
@@ -153,8 +156,9 @@ impl PipelineStage {
             Self::Inventory => 0,
             Self::Synthesis => 1,
             Self::Interaction => 2,
-            Self::Reachability => 3,
-            Self::Verify => 4,
+            Self::CompositeSynthesis => 3,
+            Self::Reachability => 4,
+            Self::Verify => 5,
         }
     }
 }
@@ -307,5 +311,28 @@ mod tests {
             args.rerun_stages,
             vec![PipelineStage::Interaction, PipelineStage::Verify]
         );
+    }
+
+    #[test]
+    fn analyze_parses_composite_synthesis_stage() {
+        let cli = Cli::parse_from([
+            "vcamper",
+            "analyze",
+            "--repo",
+            ".",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--provider",
+            "codex",
+            "--out",
+            "out",
+            "--start-at-stage",
+            "composite_synthesis",
+        ]);
+
+        let Commands::Analyze(args) = cli.command;
+        assert_eq!(args.start_at_stage, Some(PipelineStage::CompositeSynthesis));
     }
 }

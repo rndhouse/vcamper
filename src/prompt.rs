@@ -12,6 +12,7 @@ use crate::types::{CommitCandidate, FileStat, ScreeningAnalysis};
 const SCREEN_COMMIT_TEMPLATE: &str = include_str!("../prompts/analyze_commit.md");
 const SYNTHESIS_TEMPLATE: &str = include_str!("../prompts/synthesis_commit.md");
 const INTERACTION_TEMPLATE: &str = include_str!("../prompts/interaction_commit.md");
+const COMPOSITE_TEMPLATE: &str = include_str!("../prompts/composite_commit.md");
 const REACHABILITY_TEMPLATE: &str = include_str!("../prompts/reachability_commit.md");
 const VERIFY_COMMIT_TEMPLATE: &str = include_str!("../prompts/verify_commit.md");
 
@@ -187,6 +188,21 @@ pub(crate) fn render_codex_interaction_prompt(prompt_input_path: &Path) -> Strin
     )
 }
 
+/// Renders the Codex-specific composite-synthesis prompt for grouped hypotheses.
+pub(crate) fn render_codex_composite_prompt(prompt_input_path: &Path) -> String {
+    format!(
+        "{COMPOSITE_TEMPLATE}\n\n\
+         All evidence for this composite-synthesis review is available in the bundle referenced by\n\
+         `{prompt_input_path}`.\n\
+         Start with that `prompt-input.json` file.\n\
+         Inspect the absolute file paths it provides for the grouped patch subset,\n\
+         hotspot plan, source hypotheses, and before/after snapshots.\n\
+         Treat the supplied source hypotheses as inputs to combine, not as final conclusions.\n\
+         Return a JSON object that matches the supplied schema.\n",
+        prompt_input_path = prompt_input_path.display(),
+    )
+}
+
 /// Renders the Codex-specific reachability prompt for one screened hypothesis.
 pub(crate) fn render_codex_reachability_prompt(prompt_input_path: &Path) -> String {
     format!(
@@ -261,10 +277,11 @@ pub(crate) fn render_codex_verify_prompt(prompt_input_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_prompt_input, build_verification_prompt_input, render_codex_interaction_prompt,
-        render_codex_reachability_prompt, render_codex_screen_cluster_prompt,
-        render_codex_screen_plan_prompt, render_codex_synthesis_prompt, render_codex_verify_prompt,
-        render_screen_prompt, render_verify_prompt,
+        build_prompt_input, build_verification_prompt_input, render_codex_composite_prompt,
+        render_codex_interaction_prompt, render_codex_reachability_prompt,
+        render_codex_screen_cluster_prompt, render_codex_screen_plan_prompt,
+        render_codex_synthesis_prompt, render_codex_verify_prompt, render_screen_prompt,
+        render_verify_prompt,
     };
     use crate::hotspot::HotspotCluster;
     use crate::types::{CommitCandidate, CommitRecord, FileStat, ScreeningAnalysis};
@@ -391,6 +408,15 @@ mod tests {
         assert!(prompt.contains("/tmp/interaction/prompt-input.json"));
         assert!(prompt.contains("interaction review"));
         assert!(prompt.contains("shared verification"));
+    }
+
+    #[test]
+    fn codex_composite_prompt_points_to_bundle_files() {
+        let prompt = render_codex_composite_prompt(Path::new("/tmp/composite/prompt-input.json"));
+
+        assert!(prompt.contains("/tmp/composite/prompt-input.json"));
+        assert!(prompt.contains("composite-synthesis review"));
+        assert!(prompt.contains("source hypotheses"));
     }
 
     #[test]
