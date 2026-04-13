@@ -208,8 +208,19 @@ fn render_summary(report: &AnalysisReport) -> String {
         .stop_after_stage
         .clone()
         .unwrap_or_else(|| "full pipeline".to_owned());
+    let inventory_focuses = if report.manifest.inventory_focuses.is_empty() {
+        "full hotspot set".to_owned()
+    } else {
+        report
+            .manifest
+            .inventory_focuses
+            .iter()
+            .map(|focus| focus.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     output.push_str(&format!(
-        "- Repo: `{}`\n- Range: `{}`..`{}`\n- Provider: `{}`\n- Model: `{}`\n- Screen effort: `{}`\n- Verify effort: `{}`\n- Stop after stage: `{}`\n- Commits analyzed: `{}`\n- Candidates: `{}`\n\n",
+        "- Repo: `{}`\n- Range: `{}`..`{}`\n- Provider: `{}`\n- Model: `{}`\n- Screen effort: `{}`\n- Verify effort: `{}`\n- Stop after stage: `{}`\n- Inventory focuses: `{}`\n- Commits analyzed: `{}`\n- Candidates: `{}`\n\n",
         report.manifest.repo_root,
         report.manifest.from,
         report.manifest.to,
@@ -230,6 +241,7 @@ fn render_summary(report: &AnalysisReport) -> String {
             .clone()
             .unwrap_or_else(|| "provider default".to_owned()),
         stop_after,
+        inventory_focuses,
         report.manifest.commit_count,
         report.candidate_count
     ));
@@ -345,6 +357,7 @@ mod tests {
                 max_patch_bytes: 100,
                 dry_run: false,
                 stop_after_stage: None,
+                inventory_focuses: Vec::new(),
             },
             &candidates,
             &outcomes,

@@ -299,6 +299,9 @@ pub(crate) struct RunManifest {
     pub(crate) dry_run: bool,
     /// Optional staged stop boundary for partial runs.
     pub(crate) stop_after_stage: Option<String>,
+    /// Optional shortlist of hotspot focus indexes selected for Codex inventory.
+    #[serde(default)]
+    pub(crate) inventory_focuses: Vec<usize>,
 }
 
 /// Persisted progress state for one analysis run.

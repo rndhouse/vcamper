@@ -55,6 +55,7 @@ Useful flags:
 - `--max-patch-bytes <n>`: cap the diff bytes stored in truncated commit artifacts and inline fallback prompts
 - `--out <dir>`: write artifacts to a specific run directory
 - `--stop-after-stage <inventory|interaction|reachability|verify>`: stop after a staged Codex boundary so you can inspect one stage in isolation
+- `--inventory-focuses <i,j,...>`: restrict Codex inventory to a specific hotspot-focus shortlist while preserving the original focus indexes in artifacts
 - `--verbose`: print detailed internal logs and streamed provider output
 
 Re-run the same command with the same `--out` directory to resume after an interruption. VCamper reuses completed commit candidates, restarts from the first unfinished candidate, and continues forward from there.
@@ -70,7 +71,7 @@ For Codex runs, VCamper persists a pass-local evidence bundle and points the mod
 - reachability: review each inventoried hypothesis in isolation with a smaller bundle and classify its exposure surface without prematurely discarding interaction-dependent theories
 - adjudication: compare only the shortlisted reachability survivors and pick the strongest supported finding, or reject them all
 
-That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, interaction review, or reachability before continuing.
+That keeps each prompt narrower, makes stage progress inspectable, avoids losing diff context to prompt-size truncation, preserves interaction-heavy crypto theories when direct call paths stay incomplete, and bounds the final adjudication context by byte budget instead of a fixed hypothesis count. Use `--stop-after-stage` to execute only one staged boundary when you want to inspect inventory, interaction review, or reachability before continuing. Use `--inventory-focuses` when you want to rerun only a shortlist of hotspot focus units through later stages.
 
 VCamper also writes `progress.json` at the run root. It starts with `count_pending` and `count_complete`, then lists unfinished candidates under `pending` and completed candidates under `complete`. Pending candidates now include `active_stage`, so long Codex runs show whether a candidate is in inventory, reachability, or adjudication.
 
@@ -93,7 +94,7 @@ The analysis flow is still reported as `screen` then `verify`, but Codex interna
 
 VCamper requires `--out` for every run. Each output directory contains:
 
-- `manifest.json`: selected repo, range, and CLI settings
+- `manifest.json`: selected repo, range, CLI settings, and any inventory-focus shortlist used for the run
 - `progress.json`: pretty-printed pending and complete candidate lists with top-level counters and per-candidate `active_stage`
 - `wip/candidate-*`: in-progress candidate artifacts that have not completed yet
 - `candidate-*/input.json`: collected commit evidence artifact for a completed candidate

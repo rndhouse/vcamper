@@ -98,6 +98,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         max_patch_bytes: args.max_patch_bytes,
         dry_run: args.dry_run,
         stop_after_stage: args.stop_after_stage.map(|stage| stage.as_str().to_owned()),
+        inventory_focuses: args.inventory_focuses.clone(),
     };
     ensure_manifest(&run_dir, &manifest, verbose)?;
     log_step(
@@ -218,6 +219,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                 &repo_root,
                 &screen_dir,
                 candidate,
+                &args.inventory_focuses,
             )?),
             ProviderKind::Claude => {
                 let screen_prompt = prepare_screen_pass_artifacts(
@@ -225,6 +227,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
                     &repo_root,
                     &screen_dir,
                     candidate,
+                    &args.inventory_focuses,
                 )?;
                 persist_pass_artifacts(
                     &screen_dir,
@@ -495,6 +498,9 @@ fn validate_args(args: &AnalyzeArgs) -> Result<()> {
     }
     if args.stop_after_stage.is_some() && !matches!(args.provider, ProviderKind::Codex) {
         bail!("--stop-after-stage is currently supported only with --provider codex");
+    }
+    if !args.inventory_focuses.is_empty() && !matches!(args.provider, ProviderKind::Codex) {
+        bail!("--inventory-focuses is currently supported only with --provider codex");
     }
     Ok(())
 }
@@ -841,10 +847,16 @@ fn prepare_screen_pass_artifacts(
     repo_root: &Path,
     pass_dir: &Path,
     candidate: &CommitCandidate,
+    inventory_focuses: &[usize],
 ) -> Result<String> {
     match provider {
         ProviderKind::Codex => {
-            let artifacts = prepare_codex_screen_plan_artifacts(repo_root, pass_dir, candidate)?;
+            let artifacts = prepare_codex_screen_plan_artifacts(
+                repo_root,
+                pass_dir,
+                candidate,
+                inventory_focuses,
+            )?;
             let prompt_input_path = absolute_artifact_path(&pass_dir.join("prompt-input.json"))?;
             Ok(prompt::render_codex_screen_plan_prompt(
                 artifacts.clusters.len(),
@@ -919,15 +931,40 @@ fn build_inventory_focuses(hotspot_plan: &HotspotPlan) -> Vec<HotspotCluster> {
         .collect()
 }
 
+/// Filters hotspot focus units to an explicit shortlist when one was requested.
+fn select_inventory_focuses(
+    inventory_focuses: &[HotspotCluster],
+    selected_indexes: &[usize],
+) -> Result<Vec<HotspotCluster>> {
+    if selected_indexes.is_empty() {
+        return Ok(inventory_focuses.to_vec());
+    }
+
+    let mut selected = Vec::with_capacity(selected_indexes.len());
+    for index in selected_indexes {
+        let Some(cluster) = inventory_focuses
+            .iter()
+            .find(|cluster| cluster.cluster_index == *index)
+        else {
+            bail!("--inventory-focuses references missing hotspot focus index {index}");
+        };
+        selected.push(cluster.clone());
+    }
+
+    Ok(selected)
+}
+
 /// Prepares one focused Codex inventory plan and its evidence bundles.
 fn prepare_codex_screen_plan_artifacts(
     repo_root: &Path,
     screen_dir: &Path,
     candidate: &CommitCandidate,
+    selected_focuses: &[usize],
 ) -> Result<CodexInventoryPlanArtifacts> {
     let full_patch = git::load_full_patch(repo_root, &candidate.commit.id)?;
     let hotspot_plan = hotspot::build_hotspot_plan(&full_patch);
-    let inventory_focuses = build_inventory_focuses(&hotspot_plan);
+    let inventory_focuses =
+        select_inventory_focuses(&build_inventory_focuses(&hotspot_plan), selected_focuses)?;
     let evidence = persist_codex_evidence_bundle(
         screen_dir,
         repo_root,
@@ -2508,7 +2545,8 @@ mod tests {
         CodexReachabilityRecord, absolute_artifact_path, bundle_snapshot_path, ensure_manifest,
         initialize_progress_state, load_progress_state, load_saved_candidate_outcome,
         merge_codex_inventory_results, persist_candidate_outcome, select_adjudication_finalists,
-        should_keep_reachability_result, should_review_reachability, validate_args,
+        select_inventory_focuses, should_keep_reachability_result, should_review_reachability,
+        validate_args,
     };
     use crate::cli::{AnalyzeArgs, PipelineStage, ProviderKind};
     use crate::hotspot::HotspotCluster;
@@ -2540,6 +2578,7 @@ mod tests {
             verbose: false,
             dry_run: true,
             stop_after_stage: None,
+            inventory_focuses: Vec::new(),
         };
         assert!(validate_args(&args).is_err());
     }
@@ -2562,6 +2601,31 @@ mod tests {
             verbose: false,
             dry_run: true,
             stop_after_stage: Some(PipelineStage::Inventory),
+            inventory_focuses: Vec::new(),
+        };
+
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn rejects_inventory_focuses_for_claude() {
+        let args = AnalyzeArgs {
+            repo: PathBuf::from("."),
+            from: "a".into(),
+            to: "b".into(),
+            provider: ProviderKind::Claude,
+            model: None,
+            effort: None,
+            screen_effort: None,
+            verify_effort: None,
+            max_commits: None,
+            max_patch_bytes: 100,
+            min_confidence: 0.5,
+            out: PathBuf::from("out"),
+            verbose: false,
+            dry_run: true,
+            stop_after_stage: None,
+            inventory_focuses: vec![1, 4],
         };
 
         assert!(validate_args(&args).is_err());
@@ -2844,6 +2908,35 @@ mod tests {
         assert_eq!(merged.hypotheses[0].finding.title, "higher confidence");
     }
 
+    #[test]
+    fn select_inventory_focuses_keeps_requested_indexes_and_order() {
+        let cluster0 = sample_cluster("digest_length_verify");
+        let mut cluster4 = sample_cluster("digest_length_sign");
+        cluster4.cluster_index = 4;
+        let mut cluster9 = sample_cluster("pkcs7_verify");
+        cluster9.cluster_index = 9;
+
+        let selected = select_inventory_focuses(&[cluster0, cluster4, cluster9], &[9, 0])
+            .expect("focus selection should work");
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].cluster_index, 9);
+        assert_eq!(selected[1].cluster_index, 0);
+    }
+
+    #[test]
+    fn select_inventory_focuses_rejects_missing_indexes() {
+        let cluster0 = sample_cluster("digest_length_verify");
+        let error =
+            select_inventory_focuses(&[cluster0], &[3]).expect_err("missing focus should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--inventory-focuses references missing hotspot focus index 3")
+        );
+    }
+
     fn sample_manifest(provider: &str) -> RunManifest {
         RunManifest {
             provider: provider.to_owned(),
@@ -2857,6 +2950,7 @@ mod tests {
             max_patch_bytes: 100,
             dry_run: false,
             stop_after_stage: None,
+            inventory_focuses: Vec::new(),
         }
     }
 

@@ -85,6 +85,10 @@ pub(crate) struct AnalyzeArgs {
     /// Stop after the selected staged analysis step instead of running the full pipeline.
     #[arg(long, value_enum)]
     pub(crate) stop_after_stage: Option<PipelineStage>,
+
+    /// Restrict Codex inventory to specific hotspot focus indexes.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) inventory_focuses: Vec<usize>,
 }
 
 /// Agent providers supported by the CLI proof of concept.
@@ -184,6 +188,7 @@ mod tests {
         assert_eq!(args.max_patch_bytes, 40_000);
         assert_eq!(args.min_confidence, 0.65);
         assert_eq!(args.stop_after_stage, None);
+        assert!(args.inventory_focuses.is_empty());
     }
 
     #[test]
@@ -207,5 +212,28 @@ mod tests {
 
         let Commands::Analyze(args) = cli.command;
         assert_eq!(args.stop_after_stage, Some(PipelineStage::Inventory));
+    }
+
+    #[test]
+    fn analyze_parses_inventory_focuses() {
+        let cli = Cli::parse_from([
+            "vcamper",
+            "analyze",
+            "--repo",
+            ".",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--provider",
+            "codex",
+            "--out",
+            "out",
+            "--inventory-focuses",
+            "0,1,4,9",
+        ]);
+
+        let Commands::Analyze(args) = cli.command;
+        assert_eq!(args.inventory_focuses, vec![0, 1, 4, 9]);
     }
 }
