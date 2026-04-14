@@ -42,22 +42,7 @@ That commit is a good example of why VCamper has staged Codex passes. A single b
 
 The composite finalist is the interesting one. In the final staged run, VCamper confirmed a `0.90` finding that signed-object verification let attacker-controlled signature OIDs steer ECDSA verification to mismatched or below-policy digests. That is not an exact restatement of the published CVE, which also emphasizes mixed EdDSA / ML-DSA enablement, but it lands in the same patch family and shows useful behavior on a noisy crypto commit: VCamper preserved multiple theories, verified them independently, and recovered the shared verification boundary instead of forcing one winner too early.
 
-The staged workflow for cases like this is:
-
-```bash
-cargo run -- analyze \
-  --repo /path/to/wolfssl \
-  --from abce5be989ccd0665e2b9445abb856886975dfd1 \
-  --to abce5be989ccd0665e2b9445abb856886975dfd1 \
-  --provider codex \
-  --model gpt-5.4 \
-  --screen-effort xhigh \
-  --verify-effort xhigh \
-  --stop-after-stage inventory \
-  --out /tmp/vcamper-wolfssl-cve-2026-5194
-```
-
-After inspecting the inventory output and selecting the main verification-related hotspot focuses, continue from the later staged boundary instead of rerunning from scratch:
+One end-to-end command is enough to show the current prototype behavior on this commit:
 
 ```bash
 cargo run -- analyze \
@@ -69,12 +54,10 @@ cargo run -- analyze \
   --screen-effort xhigh \
   --verify-effort xhigh \
   --inventory-focuses 0,1,3,4,9 \
-  --start-at-stage composite_synthesis \
-  --rerun-stages composite_synthesis,reachability,verify \
   --out /tmp/vcamper-wolfssl-cve-2026-5194
 ```
 
-This is the current ceiling of the prototype on hard crypto commits: it can recover the right patch family and shared trust boundary, but exact CVE narrative matching still depends on stronger mixed-feature reasoning in later stages.
+That command still uses a curated hotspot shortlist because this commit is unusually noisy. The point of the example is not that VCamper reproduces the CNA text exactly. The point is that it still recovers the right patch family and a useful composite signed-object verification theory from a commit that looks like compliance churn on first read. This is the current ceiling of the prototype on hard crypto commits: it can recover the shared trust boundary and multiple verified security stories, but exact CVE narrative matching still depends on stronger mixed-feature reasoning in later stages.
 
 ## Usage
 
