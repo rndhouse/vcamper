@@ -14,7 +14,7 @@ Follow updates: [x.com/rndhouse](https://x.com/rndhouse)
 
 curl fixed `CVE-2025-0725` in commit [`76f83f0db23846e254d940ec7fe141010077eb88`](https://github.com/curl/curl/commit/76f83f0db23846e254d940ec7fe141010077eb88), titled `content_encoding: drop support for zlib before 1.2.0.4`. The title reads like compatibility maintenance. The fix was public in curl's GitHub repo on January 24, 2025, when [PR #16079](https://github.com/curl/curl/pull/16079) was opened and merged later that day. curl published the advisory on February 5, 2025. That left a public code-to-advisory gap of about 12 days. Sources: [curl advisory](https://curl.se/docs/CVE-2025-0725.html), [curl PR #16079](https://github.com/curl/curl/pull/16079).
 
-VCamper analyzed that fix commit in isolation with a two-pass run:
+VCamper analyzed that fix commit in isolation with a single end-to-end run:
 
 ```bash
 cargo run -- analyze \
@@ -28,9 +28,9 @@ cargo run -- analyze \
   --out /tmp/vcamper-curl-cve-2025-0725
 ```
 
-In the resulting analysis, VCamper flagged the commit as security-relevant with confidence `0.91` and concluded that the removed old-zlib gzip fallback allowed attacker-driven header accumulation, `uInt` wraparound, and plausible heap corruption. The verifier reasoned that the legacy parser buffered attacker-controlled gzip header bytes until a terminator arrived, stored the cumulative length in `z->avail_in` as `uInt`, and could wrap that accumulator into an undersized reallocation followed by out-of-bounds `memcpy`. The same path also supported remote memory-exhaustion DoS.
+In the resulting analysis, VCamper flagged the commit as security-relevant with confidence `0.95` and concluded that the removed old-zlib gzip fallback allowed a remote server to keep curl clients buffering attacker-controlled gzip header bytes without a bound until memory was exhausted. The verifier reasoned that the legacy parser stayed in `GZIP_UNDERFLOW` while optional gzip header fields lacked their terminating NUL, and curl kept reallocating and appending attacker-supplied bytes to `z->next_in` without decompression progress. The strongest supported consequence in the current pipeline is remote client-side memory-exhaustion DoS.
 
-That result is close to curl's published root-cause description. curl classifies the issue as `CWE-680`, an integer overflow that leads to buffer overflow. VCamper reached the same vulnerable path and converged on the same consequence class from the public fix commit alone, without using the CVE text during analysis.
+That result still lands on the right vulnerable path from the public fix commit alone, without using the CVE text during analysis. The current pipeline is more conservative about consequence class than curl's published advisory: curl classifies the issue as `CWE-680`, while VCamper now stops at a well-supported remote resource-consumption bug in the same old-zlib fallback parser.
 
 ### wolfSSL CVE-2026-5194
 
