@@ -30,6 +30,52 @@ In the resulting analysis, VCamper flagged the commit as security-relevant with 
 
 That result is close to curl's published root-cause description. curl classifies the issue as `CWE-680`, an integer overflow that leads to buffer overflow. VCamper reached the same vulnerable path and converged on the same consequence class from the public fix commit alone, without using the CVE text during analysis.
 
+### wolfSSL CVE-2026-5194
+
+wolfSSL fixed [`CVE-2026-5194`](https://app.opencve.io/cve/CVE-2026-5194) in commit [`abce5be989ccd0665e2b9445abb856886975dfd1`](https://github.com/wolfSSL/wolfssl/commit/abce5be989ccd0665e2b9445abb856886975dfd1) from [PR #10131](https://github.com/wolfSSL/wolfssl/pull/10131), titled `20260403-WC_FIPS_186`. This is a harder case than curl. The patch mixes FIPS 186 compliance work, test updates, signature-OID checks, and digest-length checks across `wolfcrypt/src/asn.c`, `wolfcrypt/src/ecc.c`, `src/pk_ec.c`, `src/internal.c`, and `wolfcrypt/src/pkcs7.c`.
+
+That commit is a good example of why VCamper has staged Codex passes. A single broad prompt drifted toward the wrong local bug story. The staged pipeline surfaced three distinct verified findings from the same commit instead:
+
+- a shared ASN.1 `signatureAlgorithm` / key-family binding flaw in `ConfirmSignature`
+- a direct pre-hash ECDSA verification bug on the public wrapper path
+- a broader composite signed-object verification theory that ties algorithm binding to shared ECDSA digest-policy enforcement
+
+The composite finalist is the interesting one. In the final staged run, VCamper confirmed a `0.90` finding that signed-object verification let attacker-controlled signature OIDs steer ECDSA verification to mismatched or below-policy digests. That is not an exact restatement of the published CVE, which also emphasizes mixed EdDSA / ML-DSA enablement, but it lands in the same patch family and shows useful behavior on a noisy crypto commit: VCamper preserved multiple theories, verified them independently, and recovered the shared verification boundary instead of forcing one winner too early.
+
+The staged workflow for cases like this is:
+
+```bash
+cargo run -- analyze \
+  --repo /path/to/wolfssl \
+  --from abce5be989ccd0665e2b9445abb856886975dfd1 \
+  --to abce5be989ccd0665e2b9445abb856886975dfd1 \
+  --provider codex \
+  --model gpt-5.4 \
+  --screen-effort xhigh \
+  --verify-effort xhigh \
+  --stop-after-stage inventory \
+  --out /tmp/vcamper-wolfssl-cve-2026-5194
+```
+
+After inspecting the inventory output and selecting the main verification-related hotspot focuses, continue from the later staged boundary instead of rerunning from scratch:
+
+```bash
+cargo run -- analyze \
+  --repo /path/to/wolfssl \
+  --from abce5be989ccd0665e2b9445abb856886975dfd1 \
+  --to abce5be989ccd0665e2b9445abb856886975dfd1 \
+  --provider codex \
+  --model gpt-5.4 \
+  --screen-effort xhigh \
+  --verify-effort xhigh \
+  --inventory-focuses 0,1,3,4,9 \
+  --start-at-stage composite_synthesis \
+  --rerun-stages composite_synthesis,reachability,verify \
+  --out /tmp/vcamper-wolfssl-cve-2026-5194
+```
+
+This is the current ceiling of the prototype on hard crypto commits: it can recover the right patch family and shared trust boundary, but exact CVE narrative matching still depends on stronger mixed-feature reasoning in later stages.
+
 ## Usage
 
 ```bash
