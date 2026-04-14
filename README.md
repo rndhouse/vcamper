@@ -6,6 +6,8 @@ Public code and public security communication do not always happen at the same t
 
 VCamper works from that asymmetry. Instead of searching an entire system for unknown vulnerabilities, it analyzes the much smaller surface area of recent code changes, asks an agent to evaluate one commit candidate at a time, and highlights the commits most likely to be vulnerability fixes.
 
+Follow updates: [x.com/rndhouse](https://x.com/rndhouse)
+
 ## Example
 
 ### curl CVE-2025-0725
